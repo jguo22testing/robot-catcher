@@ -11,7 +11,7 @@ Headless batch evaluation (oracle catch rate):
 
 Plan on a noisy belief instead of the ground truth (see catcher.planning), optionally with
 a pillar in front of the robot, occlusion, and the multimodal particle belief:
-    python scripts/run_catch.py --stage 2 --seed 3 --planner hedge [--pillar] [--occlusion] [--predictor particle]
+    python scripts/run_catch.py --stage 2 --seed 3 --planner uncertainty-aware [--pillar] [--occlusion] [--predictor particle]
 """
 
 import argparse
@@ -26,9 +26,9 @@ from catcher.planning import HedgePlanner, MeanPlanner, particle_predictor_for, 
 from catcher.throws import sample_stage_throw
 
 PLANNERS = {"oracle": lambda pf: None,
-            "mean": lambda pf: MeanPlanner(pf),
-            "mean-replan": lambda pf: HedgePlanner(pf, hedge=False),
-            "hedge": lambda pf: HedgePlanner(pf)}
+            "plan-once": lambda pf: MeanPlanner(pf),
+            "mean-only": lambda pf: HedgePlanner(pf, hedge=False),
+            "uncertainty-aware": lambda pf: HedgePlanner(pf)}
 
 
 def save_gif(frames, path: Path, fps: float):

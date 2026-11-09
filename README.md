@@ -26,7 +26,7 @@ uv run pytest      # sanity tests for the ball sim and throw generator
 | `models/kuka_iiwa_14/` | iiwa14 model vendored from [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) (Apache-2.0). |
 | `scripts/simulate_ball.py` | Plot a few throws (3D + side view, bounces, catch points). |
 | `scripts/generate_dataset.py` | Write a stage dataset to `data/*.npz`. |
-| `scripts/run_catch.py` | Simulate one catch and save a GIF, replay it in the MuJoCo viewer (`--viewer`), or `--eval N` for a headless catch rate. `--planner` (`mean`, `mean-replan` or `hedge`) plans on a belief instead of the ground truth; `--predictor`, `--pillar` and `--occlusion` as in `compare_planners.py`. |
+| `scripts/run_catch.py` | Simulate one catch and save a GIF, replay it in the MuJoCo viewer (`--viewer`), or `--eval N` for a headless catch rate. `--planner` (`plan-once`, `mean-only` or `uncertainty-aware`) plans on a belief instead of the ground truth; `--predictor`, `--pillar` and `--occlusion` as in `compare_planners.py`. |
 
 ## Bounce Lab (web UI)
 
@@ -97,12 +97,12 @@ draws whole trajectories from it (exact Gaussian marginals at every time, smooth
 
 | Planner | What it does |
 |---|---|
-| `MeanPlanner` | Observes for `t_plan`, then commits once to the earliest reachable belief mean. |
-| `HedgePlanner` | Fixes the catch time at `t_plan`, then re-plans every 50 ms on the sharper belief until 0.1 s before the catch. Each re-plan samples trajectories from the belief, keeps those inside the 90% ellipsoid at the catch time, solves the catch IK for each, and steers toward the joint configuration that minimizes the worst-case joint-space time to any of them (the per-joint midrange). Each segment is a cubic that starts from the reference's current position and velocity, so the arm never stops between re-plans. `hedge=False` steers toward the mean's configuration instead (an ablation). |
+| plan-once (`MeanPlanner`) | Observes for `t_plan`, then commits once to the earliest reachable belief mean. |
+| uncertainty-aware (`HedgePlanner`) | Fixes the catch time at `t_plan`, then re-plans every 50 ms on the sharper belief until 0.1 s before the catch. Each re-plan samples trajectories from the belief, keeps those inside the 90% ellipsoid at the catch time, solves the catch IK for each, and steers toward the joint configuration that minimizes the worst-case joint-space time to any of them (the per-joint midrange). Each segment is a cubic that starts from the reference's current position and velocity, so the arm never stops between re-plans. mean-only (`HedgePlanner(hedge=False)`) runs the same schedule but steers toward the mean's configuration, ignoring the uncertainty. |
 
 ```bash
-uv run python scripts/compare_planners.py --stage 2 --n 60    # oracle vs mean vs mean-replan vs hedge
-uv run python scripts/run_catch.py --stage 2 --seed 3 --planner hedge   # GIF of one belief-based catch
+uv run python scripts/compare_planners.py --stage 2 --n 60    # oracle vs plan-once vs mean-only vs uncertainty-aware
+uv run python scripts/run_catch.py --stage 2 --seed 3 --planner uncertainty-aware   # GIF of one belief-based catch
 ```
 
 Two predictors stand in for the trajectory model:
@@ -114,13 +114,13 @@ Two predictors stand in for the trajectory model:
 
 `--pillar` adds a concrete pillar 0.75–1.4 m in front of the robot. `--occlusion` stops the
 belief from sharpening while the pillar or a board hides the ball from a camera behind the robot.
-With several outcomes, the hedge planner scores waiting between them ("cover") against
+With several outcomes, the uncertainty-aware planner scores waiting between them ("cover") against
 committing to one and takes the more likely catch. Every planner re-chooses the catch time
 if the predicted ball leaves the catch zone at that time or moves 20 cm from where it was aimed.
 
 Results (60 throws, balls caught and kept in the cup):
 
-| Setup | oracle | mean | mean-replan | hedge |
+| Setup | oracle | plan-once | mean-only | uncertainty-aware |
 |---|---|---|---|---|
 | Stage 2, gaussian | 44 | 8 | 28 | 28 |
 | Stage 2 + pillar, gaussian | 49 | 16 | 31 | 31 |
@@ -129,8 +129,8 @@ Results (60 throws, balls caught and kept in the cup):
 | Stage 2 + pillar + occlusion, particle | 49 | 29 | 37 | 35 |
 | Stage 3 + pillar + occlusion, particle | 40 | 17 | 33 | 30 |
 
-- Re-planning is still what matters. Hedging doesn't help: it ties with the Gaussian belief
-  and loses 2–3 catches with the particle belief.
+- Re-planning is still what matters. Using the uncertainty doesn't help: uncertainty-aware
+  ties with mean-only on the Gaussian belief and loses 2–3 catches on the particle belief.
 - With the particle belief, "cover" never scored strictly better than committing to one
   outcome; it only won ties. Ties now go to the most likely outcome.
 - Occlusion costs at most one catch: when the pillar hides the ball it is mostly before
@@ -138,6 +138,9 @@ Results (60 throws, balls caught and kept in the cup):
 - The particle and Gaussian rows aren't a planner comparison: the particle predictor knows
   the room exactly and is sharper after the bounce, which is why every planner does better with it.
 - The arm never touches the room in any of these runs.
+
+`docs/pillar_catch.html` (open it in a browser) shows a mean-only catch of a ball bouncing
+off the pillar, with these results.
 
 Catches are always scored against the true ball. `run_catch(planner=...)` takes any
 `(kin, throw, cone_deg) -> (catch index, joint reference)` callable.

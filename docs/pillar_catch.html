@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Robot Catcher Planners</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600&family=Inter:wght@400;500&family=JetBrains+Mono:wght@400&display=swap">
+<style>
+/* Layout: one centered reading column, the side-by-side GIF as the hero, results table below */
+:root {
+  --bg: #f5f6f4; --surface: #ffffff; --fg: #1d2421; --muted: #5b6661; --line: #d9ddd9;
+  --accent: #e36414; --good: #1f7a4d; --bad: #b3361f;
+  --display: "Space Grotesk", system-ui, sans-serif; --body: "Inter", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #141816; --surface: #1c211f; --fg: #e8ece9; --muted: #9aa49f; --line: #2e3532;
+  --accent: #f08a4b; --good: #5fc28f; --bad: #ee7a62; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #141816; --surface: #1c211f; --fg: #e8ece9; --muted: #9aa49f; --line: #2e3532;
+  --accent: #f08a4b; --good: #5fc28f; --bad: #ee7a62; color-scheme: dark }
+body { background: var(--bg); color: var(--fg); font-family: var(--body); line-height: 1.55;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 32px 48px; }
+main { max-width: 1000px; margin: 0 auto; display: grid; gap: 28px; }
+h1 { font-family: var(--display); font-weight: 600; font-size: 1.9rem; margin: 0; text-wrap: balance; }
+h2 { font-family: var(--display); font-weight: 500; font-size: 1.2rem; margin: 0 0 10px; }
+p { margin: 0; max-width: 68ch; color: var(--muted); }
+.eyebrow { font-family: var(--mono); font-size: .75rem; letter-spacing: .06em; text-transform: uppercase; color: var(--accent); margin-bottom: 6px; }
+figure { margin: 0; background: #000; border-radius: 8px; overflow: hidden; }
+figure img { display: block; width: 100%; height: auto; }
+figcaption { background: var(--surface); color: var(--muted); font-size: .85rem; padding: 10px 14px; border-top: 1px solid var(--line); }
+.pair { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.pair div { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; min-width: 0; }
+.pair b { font-family: var(--display); font-weight: 500; }
+.tag { font-family: var(--mono); font-size: .8rem; padding: 2px 8px; border-radius: 99px; margin-left: 6px; }
+.miss { color: var(--bad); border: 1px solid var(--bad); } .hit { color: var(--good); border: 1px solid var(--good); }
+.tbl { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; background: var(--surface); }
+th, td { text-align: right; padding: 8px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; }
+th { font-family: var(--display); font-weight: 500; color: var(--muted); font-size: .85rem; }
+code { font-family: var(--mono); font-size: .85em; }
+@media (max-width: 560px) { .pair { grid-template-columns: 1fr; } h1 { font-size: 1.5rem; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">Stage 2 + pillar · seed 11 · bounce off the pillar edge</div>
+    <h1>Catching around a pillar</h1>
+  </header>
+  <figure>
+    <img src="catch_pillar_seed11_replan.gif" alt="A KUKA arm catches a ball that has just bounced off the edge of a concrete pillar in front of it. The ball lands in the green cup.">
+    <figcaption>The ball clips the pillar at 0.75 s and is caught about 0.2 s later, 0.9 cm from the cup center, and stays in the cup. Played back at about one third of real speed; the orange line is the ball's true path.</figcaption>
+  </figure>
+  <section class="pair">
+    <div><b>Mean-only planner</b><p>Every 50 ms the arm re-plans on the latest prediction of where the ball will be, starting each move from its current position and speed. Before the bounce the prediction is split between outcomes, so it plans on the most likely one and corrects as the prediction sharpens.</p></div>
+    <div><b>What's simulated</b><p>The arm, its torque limits, and the ball near the arm are MuJoCo physics. The prediction can't sharpen while the pillar hides the ball from the camera.</p></div>
+  </section>
+  <section>
+    <h2>Catch rates</h2>
+    <div class="tbl"><table>
+      <thead><tr><th>Setup (60 throws)</th><th>Oracle</th><th>Mean-only</th><th>Uncertainty-aware</th></tr></thead>
+      <tbody>
+        <tr><td>Stage 2 + pillar</td><td>49</td><td>37</td><td>35</td></tr>
+        <tr><td>Stage 2 + pillar + occlusion</td><td>49</td><td>37</td><td>35</td></tr>
+        <tr><td>Stage 3 + pillar + occlusion</td><td>40</td><td>33</td><td>30</td></tr>
+      </tbody>
+    </table></div>
+    <p style="margin-top:10px">A catch means the ball stays in the cup. The oracle plans on the true ball path and marks the ceiling for this arm.</p>
+  </section>
+</main>
+</body>
+</html>

@@ -1,12 +1,14 @@
 """Compare catch planners on identical throws and identical prediction errors.
 
-oracle: plans on the ground-truth ball.
-mean:   plans once on the mean of the belief (stand-in for the trajectory model).
-mean-replan: re-plans every 50 ms on the sharper belief, steering toward the mean's catch
-        configuration (same schedule as hedge, without the hedging; isolates what hedging adds).
-hedge:  re-plans every 50 ms, steering toward the configuration that minimizes the worst-case
-        joint-space time to any catch configuration in the belief's 90% region. With a
-        multimodal belief it chooses between covering every mode and committing to one.
+oracle:     plans on the ground-truth ball.
+plan-once:  plans once, at t_plan, on the belief's mean (stand-in for the trajectory model).
+mean-only:  re-plans every 50 ms on the sharper belief, steering toward the mean's catch
+            configuration (same schedule as uncertainty-aware, ignoring the uncertainty;
+            isolates what using it adds). HedgePlanner(hedge=False).
+uncertainty-aware: re-plans every 50 ms, steering toward the configuration that minimizes the
+            worst-case joint-space time to any catch configuration in the belief's 90% region.
+            With a multimodal belief it chooses between covering every mode and committing to
+            one. HedgePlanner.
 
 Beliefs: --predictor gaussian (SyntheticPredictor: one Gaussian, std growing with horizon and
 bounces) or particle (ParticlePredictor: simulated particles, can split into several modes).
@@ -50,9 +52,9 @@ def main():
         predictor_for = particle_predictor_for(args.seed, args.occlusion)
         belief = "particle belief"
     planners = {"oracle": None,
-                "mean": MeanPlanner(predictor_for, args.t_plan),
-                "mean-replan": HedgePlanner(predictor_for, args.t_plan, hedge=False),
-                "hedge": HedgePlanner(predictor_for, args.t_plan)}
+                "plan-once": MeanPlanner(predictor_for, args.t_plan),
+                "mean-only": HedgePlanner(predictor_for, args.t_plan, hedge=False),
+                "uncertainty-aware": HedgePlanner(predictor_for, args.t_plan)}
     rng = np.random.default_rng(args.seed)
     caught = {name: [] for name in planners}
     geometric = {name: [] for name in planners}
@@ -73,7 +75,7 @@ def main():
             errors[name].append(r.position_error)
             if isinstance(planner, HedgePlanner) and planner.last is not None:
                 reselected[name] += planner.last.reselections > 0
-                if name == "hedge":
+                if name == "uncertainty-aware":
                     for c in planner.last.choices:
                         hedge_choices[c] += 1
                 planner.last = None
@@ -82,12 +84,12 @@ def main():
     print(f"stage {args.stage}{' + ' + extras if extras else ''}, {args.n} throws, {belief}, planning at t = {args.t_plan} s")
     for name in planners:
         per_bounce = ", ".join(f"{b}b: {sum(v)}/{len(v)}" for b, v in sorted(by_bounces[name].items()))
-        print(f"{name:>11}: caught {sum(caught[name]):2d}/{args.n} (geometric {sum(geometric[name]):2d}), "
+        print(f"{name:>17}: caught {sum(caught[name]):2d}/{args.n} (geometric {sum(geometric[name]):2d}), "
               f"median error {100 * np.median(errors[name]):4.1f} cm, arm hit room {sum(contact[name])}  ({per_bounce})"
               + (f", catch time re-chosen in {reselected[name]}" if reselected[name] else ""))
     if any(c not in ("single",) for c in hedge_choices):
         total = sum(hedge_choices.values())
-        print("hedge re-plans by choice: " + ", ".join(f"{c} {v / total:.0%}" for c, v in sorted(hedge_choices.items())))
+        print("uncertainty-aware re-plans by choice: " + ", ".join(f"{c} {v / total:.0%}" for c, v in sorted(hedge_choices.items())))
 
 
 if __name__ == "__main__":
