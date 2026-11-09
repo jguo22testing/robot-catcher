@@ -21,6 +21,7 @@ import numpy as np
 from .belief import GaussianBelief, SyntheticPredictor
 from .mujoco_scene import Q_READY, VELOCITY_LIMITS, CubicTrajectory, Kinematics, plan_ik_catch, solve_catch_ik
 from .throws import Throw
+from .visibility import visible
 
 Predictor = Callable[[float], GaussianBelief]
 
@@ -178,10 +179,12 @@ class HedgePlanner:
         return k, SegmentedReference(segments)
 
 
-def synthetic_predictor_for(seed: int = 0, **kwargs) -> Callable[[Throw], SyntheticPredictor]:
+def synthetic_predictor_for(seed: int = 0, occlusion: bool = False, **kwargs) -> Callable[[Throw], SyntheticPredictor]:
     """predictor_for factory: a SyntheticPredictor per throw, seeded from the throw so that
-    every planner compared on the same throw sees the same prediction errors."""
+    every planner compared on the same throw sees the same prediction errors. With
+    occlusion, the belief only sharpens while the camera can see the ball."""
     def make(throw: Throw) -> SyntheticPredictor:
         throw_seed = int(abs(throw.p0).sum() * 1e6) % (2**31) + seed
-        return SyntheticPredictor(throw, seed=throw_seed, **kwargs)
+        seen = visible(throw.room, throw.pos) if occlusion else None
+        return SyntheticPredictor(throw, seed=throw_seed, seen=seen, **kwargs)
     return make

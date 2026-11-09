@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .throws import Throw
+from .visibility import last_seen_time
 
 CHI2_3D_90 = 6.25  # 0.9 quantile of the chi-squared distribution with 3 degrees of freedom
 
@@ -71,10 +72,14 @@ class SyntheticPredictor:
 
     The error realization is drawn once, so asking again at a later t_now gives the
     same mean errors with a tighter std: the belief sharpens as the ball is observed.
+
+    `seen` (T,) marks the samples where the camera sees the ball (catcher.visibility).
+    While the ball is hidden the belief stays the one from its last sighting.
     """
 
     def __init__(self, throw: Throw, sigma0: float = 0.005, growth: float = 0.06, bounce_sigma: float = 0.03,
-                 corr_time: float = 0.3, vel_sigma_ratio: float = 2.0, seed: int = 0):
+                 corr_time: float = 0.3, vel_sigma_ratio: float = 2.0, seed: int = 0,
+                 seen: np.ndarray | None = None):
         self.throw = throw
         self.sigma0, self.growth, self.bounce_sigma = sigma0, growth, bounce_sigma
         self.corr_time, self.vel_sigma_ratio = corr_time, vel_sigma_ratio
@@ -86,8 +91,10 @@ class SyntheticPredictor:
         self.error = err.sample(1, rng)[0]
         self.vel_error = rng.normal(size=throw.vel.shape)
         self.bounce_times = np.array([b.t for b in throw.traj.bounces])
+        self.seen = np.ones(len(throw.times), dtype=bool) if seen is None else seen
 
     def __call__(self, t_now: float) -> GaussianBelief:
+        t_now = last_seen_time(self.throw.times, self.seen, t_now)
         t = self.throw.times
         horizon = np.maximum(t - t_now, 0.0)
         bounces = np.array([np.sum((self.bounce_times > t_now) & (self.bounce_times <= ti)) for ti in t])
