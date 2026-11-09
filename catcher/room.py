@@ -31,6 +31,7 @@ MATERIALS = {
     "plywood": Material("plywood", restitution=0.70, friction=0.10, rgba=(0.80, 0.65, 0.40, 0.9)),
     "rubber": Material("rubber", restitution=0.90, friction=0.30, rgba=(0.20, 0.20, 0.20, 0.9)),
     "foam": Material("foam", restitution=0.30, friction=0.40, rgba=(0.30, 0.60, 0.90, 0.9)),
+    "concrete": Material("concrete", restitution=0.55, friction=0.20, rgba=(0.55, 0.55, 0.58, 1.0)),
 }
 
 
@@ -150,30 +151,63 @@ def random_board(rng: np.random.Generator, room: Room, name: str,
     return Panel(name, center, normal, u, half, material)
 
 
-def make_room(stage: int, rng: np.random.Generator) -> Room:
+def pillar(center_xy, half_size: float, room: Room, material: Material | None = None,
+           name: str = "pillar") -> list[Panel]:
+    """Floor-to-ceiling square pillar: four vertical panels with outward normals."""
+    material = material or MATERIALS["concrete"]
+    cx, cy = center_xy
+    z_lo, z_hi = room.lo[2], room.hi[2]
+    zc, hz = (z_lo + z_hi) / 2, (z_hi - z_lo) / 2
+    ez = np.array([0.0, 0.0, 1.0])
+    faces = []
+    for label, n in (("x-", (-1, 0, 0)), ("x+", (1, 0, 0)), ("y-", (0, -1, 0)), ("y+", (0, 1, 0))):
+        n = np.array(n, dtype=float)
+        u = np.cross(ez, n)
+        center = np.array([cx, cy, zc]) + half_size * n
+        faces.append(Panel(f"{name}_{label}", center, n, u, (half_size, hz), material))
+    return faces
+
+
+def random_pillar(rng: np.random.Generator, room: Room) -> list[Panel]:
+    """A pillar just in front of the robot, between it and the thrower. Its near face is at
+    x >= 0.75 m: the ready-pose cup reaches x = 0.69 m (rim included), so the arm clears
+    the pillar in the ready pose but not in every catch pose."""
+    half = rng.uniform(0.08, 0.15)
+    center = (rng.uniform(0.75 + half, 1.25), rng.uniform(-0.5, 0.5))
+    return pillar(center, half, room)
+
+
+def is_pillar(panel: Panel) -> bool:
+    return panel.name.startswith("pillar")
+
+
+def make_room(stage: int, rng: np.random.Generator, with_pillar: bool = False) -> Room:
     """Procedural room for each project stage.
 
     1: plain box room (throws go straight to the robot).
     2: box room + one flat board with a random pose and material.
     3: box room + 1-3 boards with fully randomized restitution/friction.
     4: randomized room dimensions + 2-4 random boards.
+
+    with_pillar adds a concrete pillar just in front of the robot (random_pillar).
     """
     if stage == 1:
-        return box_room()
-    if stage == 2:
+        room = box_room()
+    elif stage == 2:
         room = box_room()
         room.panels.append(random_board(rng, room, "board_0"))
-        return room
-    if stage == 3:
+    elif stage == 3:
         room = box_room()
         for i in range(rng.integers(1, 4)):
             room.panels.append(random_board(rng, room, f"board_{i}", random_restitution=True))
-        return room
-    if stage == 4:
+    elif stage == 4:
         lo = np.array([-rng.uniform(1.0, 2.0), -rng.uniform(2.0, 4.0), 0.0])
         hi = np.array([rng.uniform(4.0, 6.0), rng.uniform(2.0, 4.0), rng.uniform(2.5, 4.0)])
         room = box_room(lo, hi)
         for i in range(rng.integers(2, 5)):
             room.panels.append(random_board(rng, room, f"board_{i}", random_restitution=True))
-        return room
-    raise ValueError(f"unknown stage {stage}")
+    else:
+        raise ValueError(f"unknown stage {stage}")
+    if with_pillar:
+        room.panels.extend(random_pillar(rng, room))
+    return room

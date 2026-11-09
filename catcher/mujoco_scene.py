@@ -143,6 +143,9 @@ class Kinematics:
         self.jacp = np.zeros((3, model.nv))
         self.jacr = np.zeros((3, model.nv))
         self.lo, self.hi = model.jnt_range[:N_ARM].T  # arm joint limits
+        arm_ids = [model.body(name).id for name in ARM_BODIES]
+        self.arm_geoms = np.isin(model.geom_bodyid, arm_ids) & (model.geom_contype > 0)
+        self.ball_geom = model.geom("ball").id
 
     def __call__(self, q: np.ndarray):
         """Returns cup center position, cup axis (opening direction), and the 6x7 Jacobian."""
@@ -153,6 +156,22 @@ class Kinematics:
         R = self.data.site_xmat[self.site].reshape(3, 3)
         J = np.vstack([self.jacp[:, :N_ARM], self.jacr[:, :N_ARM]])
         return self.data.site_xpos[self.site].copy(), R[:, 2].copy(), J
+
+    def collides(self, q: np.ndarray) -> bool:
+        """Whether the arm or cup at q penetrates the room (walls, boards, pillar)."""
+        self.data.qpos[:N_ARM] = q
+        mujoco.mj_kinematics(self.model, self.data)
+        mujoco.mj_collision(self.model, self.data)
+        for c in self.data.contact[:self.data.ncon]:
+            g1, g2 = int(c.geom1), int(c.geom2)
+            if self.ball_geom not in (g1, g2) and self.arm_geoms[g1] != self.arm_geoms[g2]:
+                return True
+        return False
+
+    def path_collides(self, traj, duration: float, n: int = 12) -> bool:
+        """Whether a joint trajectory (called with time from its start) collides at any of
+        n evenly spaced times over [0, duration]."""
+        return any(self.collides(traj(t)[0]) for t in np.linspace(0.0, duration, n))
 
 
 def _cone_error(axis: np.ndarray, target_axis: np.ndarray, cone_rad: float):
@@ -195,10 +214,12 @@ def solve_catch_ik(kin: Kinematics, p_ball: np.ndarray, v_ball: np.ndarray, q_gu
 
     The damped-least-squares IK is local; if it fails from q_guess, retry from
     `restarts` random perturbations and keep the solution quickest to reach.
+    A configuration where the arm or cup penetrates the room counts as a failure.
     """
     target_axis = -v_ball / np.linalg.norm(v_ball)
     cone = np.radians(cone_half_angle_deg)
     q, ok = _solve_ik_from(kin, p_ball, target_axis, q_guess, q_guess, cone, iters, pos_tol)
+    ok = ok and not kin.collides(q)
     if ok or not restarts:
         return q, ok
     lo, hi = kin.lo, kin.hi
@@ -207,7 +228,7 @@ def solve_catch_ik(kin: Kinematics, p_ball: np.ndarray, v_ball: np.ndarray, q_gu
     for _ in range(restarts):
         q_init = np.clip(q_guess + rng.normal(0.0, 0.8, len(q_guess)), lo, hi)
         q, ok = _solve_ik_from(kin, p_ball, target_axis, q_init, q_init, cone, iters, pos_tol)
-        if ok:
+        if ok and not kin.collides(q):
             move_time = np.max(np.abs(q - q_guess) / VELOCITY_LIMITS)
             if best is None or move_time < best[0]:
                 best = (move_time, q)
@@ -268,7 +289,8 @@ def plan_ik_catch(kin: Kinematics, throw: Throw, cone_half_angle_deg: float,
                   stride: int = 2, max_candidates: int = 40, belief=None,
                   q_start: np.ndarray = Q_READY, t_start: float = 0.0):
     """Catch plan: the earliest in-workspace ball sample the arm can reach in time
-    (or the least-late one if none). Returns (index, joint trajectory).
+    (or the least-late one if none), skipping targets whose joint path hits the room.
+    Returns (index, joint trajectory).
 
     By default it plans on the ground truth (the oracle). With a `belief` (a
     GaussianBelief over the throw's time grid) it aims at the belief mean instead.
@@ -285,6 +307,8 @@ def plan_ik_catch(kin: Kinematics, throw: Throw, cone_half_angle_deg: float,
             if not ok:
                 continue
             traj = CubicTrajectory(q_start, q)
+            if kin.path_collides(traj, traj.T):
+                continue
             slack = throw.times[k] - t_start - traj.T
             if best is None or slack > best[0]:
                 best = (slack, int(k), traj)

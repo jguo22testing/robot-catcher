@@ -133,8 +133,16 @@ class HedgePlanner:
             if ok:
                 solutions.append(q)
         solutions = np.array(solutions)
-        lo, hi = kin.lo, kin.hi
-        return np.clip((solutions.min(0) + solutions.max(0)) / 2, lo, hi), solutions
+        target = np.clip((solutions.min(0) + solutions.max(0)) / 2, kin.lo, kin.hi)
+        if kin.collides(target):  # the midrange can land in the room even when every solution is clear
+            target = q_mean
+        return target, solutions
+
+    @staticmethod
+    def _segment(kin, q_now, v_now, target, time_left):
+        """Cubic from the current reference state to target, or None if its path hits the room."""
+        segment = HermiteTrajectory(q_now.copy(), v_now.copy(), target, max(time_left, min_move_time(q_now, target)))
+        return None if kin.path_collides(segment, segment.T) else segment
 
     def __call__(self, kin: Kinematics, throw: Throw, cone_deg: float):
         predictor = self.predictor_for(throw)
@@ -158,9 +166,15 @@ class HedgePlanner:
                 worst = lambda q: float(np.max(np.abs(solutions - q) / VELOCITY_LIMITS))
                 q_mean0 = solutions[0]
                 self.last = HedgePlan(target, len(solutions), worst(target), worst(q_mean0), len(replan_times))
-            duration = max(t_c - self.arrive_lead - t_r, min_move_time(q_now, target))
-            segments.append((t_r, HermiteTrajectory(q_now.copy(), v_now.copy(), target, duration)))
             q_guess = solutions[0]
+            segment = self._segment(kin, q_now, v_now, target, t_c - self.arrive_lead - t_r)
+            if segment is None:
+                segment = self._segment(kin, q_now, v_now, solutions[0], t_c - self.arrive_lead - t_r)
+            if segment is None:
+                if segments:  # keep following the previous, collision-free segment
+                    continue
+                return k, SegmentedReference([(self.t_plan, CubicTrajectory(Q_READY, Q_READY))])
+            segments.append((t_r, segment))
         return k, SegmentedReference(segments)
 
 

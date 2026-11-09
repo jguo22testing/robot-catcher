@@ -97,10 +97,11 @@ def sample_throw(room: Room, rng: np.random.Generator, min_bounces: int = 0, max
 STAGE_BOUNCES = {1: (0, 0), 2: (1, 1), 3: (1, 3), 4: (1, 4)}
 
 
-def sample_stage_throw(stage: int, rng: np.random.Generator, t_end: float = 3.0) -> Throw:
+def sample_stage_throw(stage: int, rng: np.random.Generator, t_end: float = 3.0,
+                       with_pillar: bool = False) -> Throw:
     lo, hi = STAGE_BOUNCES[stage]
     for _ in range(50):  # resample the room if it makes valid throws too rare
-        room = make_room(stage, rng)
+        room = make_room(stage, rng, with_pillar)
         try:
             return sample_throw(room, rng, lo, hi, t_end=t_end, max_tries=2000)
         except RuntimeError:

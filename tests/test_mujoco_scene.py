@@ -2,7 +2,7 @@ import numpy as np
 
 from catcher.ball_sim import simulate
 from catcher.mujoco_scene import Q_READY, CubicTrajectory, Kinematics, build_model, run_catch, solve_catch_ik
-from catcher.room import box_room
+from catcher.room import box_room, pillar, random_pillar
 from catcher.throws import Throw, sample_stage_throw
 
 
@@ -54,3 +54,32 @@ def test_ball_dropped_into_a_still_cup_stays_in():
     throw = Throw(room, p0, np.zeros(3), traj, times, pos, vel, k, 0)
     r = run_catch(throw, planner=_hold, sim_time=1.4)
     assert r.success
+
+
+def test_random_pillars_clear_the_ready_pose():
+    rng = np.random.default_rng(0)
+    for _ in range(200):
+        room = box_room()
+        room.panels += random_pillar(rng, room)
+        assert not Kinematics(build_model(room)).collides(Q_READY)
+
+
+def test_collision_check_sees_the_pillar_and_the_floor():
+    room = box_room()
+    room.panels += pillar((0.6, 0.0), 0.1, room)
+    assert Kinematics(build_model(room)).collides(Q_READY)
+    folded = Q_READY.copy()
+    folded[1], folded[3] = 1.9, 0.0
+    assert Kinematics(build_model(box_room())).collides(folded)
+
+
+def test_catch_ik_avoids_the_pillar():
+    room = box_room()
+    room.panels += pillar((0.95, 0.0), 0.15, room)
+    kin = Kinematics(build_model(room))
+    rng = np.random.default_rng(0)
+    for _ in range(20):
+        p = np.array([rng.uniform(0.3, 0.75), rng.uniform(-0.5, 0.5), rng.uniform(0.4, 0.9)])
+        q, ok = solve_catch_ik(kin, p, np.array([-4.0, 0.0, -3.0]), Q_READY, 25, restarts=4)
+        if ok:
+            assert not kin.collides(q)
