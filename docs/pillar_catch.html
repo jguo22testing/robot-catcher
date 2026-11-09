@@ -40,6 +40,10 @@ th, td { text-align: right; padding: 8px 12px; border-bottom: 1px solid var(--li
 th:first-child, td:first-child { text-align: left; }
 th { font-family: var(--display); font-weight: 500; color: var(--muted); font-size: .85rem; }
 code { font-family: var(--mono); font-size: .85em; }
+.explain { display: grid; gap: 14px; }
+.explain h3 { font-family: var(--display); font-weight: 500; font-size: 1rem; margin: 0 0 4px; }
+.explain ol, .explain ul { margin: 0; padding-left: 1.3em; max-width: 68ch; color: var(--muted); display: grid; gap: 6px; }
+.explain li::marker { color: var(--accent); }
 @media (max-width: 560px) { .pair { grid-template-columns: 1fr; } h1 { font-size: 1.5rem; } }
 </style>
 </head>
@@ -68,6 +72,36 @@ code { font-family: var(--mono); font-size: .85em; }
       </tbody>
     </table></div>
     <p style="margin-top:10px">A catch means the ball stays in the cup. The oracle plans on the true ball path and marks the ceiling for this arm.</p>
+  </section>
+  <section class="explain">
+    <h2>What the uncertainty-aware planner does</h2>
+    <p>It runs the same loop as mean-only. At 0.1 s it picks a catch time on the most likely predicted path; every 50 ms until 0.1 s before the catch it takes a fresh prediction, chooses a target arm pose, and moves smoothly from where the arm is so it arrives 30 ms before the catch; it re-picks the catch time if the predicted ball leaves reach or moves 20 cm. The only difference is the target pose.</p>
+    <div>
+      <h3>One predicted outcome</h3>
+      <ol>
+        <li>Sample 64 possible ball positions at the catch time and keep the most likely 90%.</li>
+        <li>Solve the arm pose that catches each one.</li>
+        <li>Head for the pose with the shortest worst-case switch to any of them: per joint, halfway between its smallest and largest value.</li>
+      </ol>
+    </div>
+    <div>
+      <h3>Several possible outcomes, such as clipping the pillar edge or not</h3>
+      <ol>
+        <li>Candidates: a pose in the middle of all outcomes, and one in the middle of each outcome.</li>
+        <li>Score each by the chance of still catching in time if the arm waits there until the paths part (plus 50 ms to see which is real), then goes straight to the catch, weighted by each outcome's probability.</li>
+        <li>Take the best; ties go to the most likely outcome.</li>
+      </ol>
+    </div>
+    <div>
+      <h3>Why it doesn't beat mean-only</h3>
+      <ul>
+        <li>For one bell curve, the halfway pose is nearly the pose for the average ball, so both planners head almost the same way.</li>
+        <li>By the last update, 0.1 s before the catch, the prediction is within 1&ndash;2 cm, and earlier aims get overwritten.</li>
+        <li>Waiting between outcomes never scored strictly better than committing to the most likely one, so with several outcomes it behaves like mean-only.</li>
+        <li>The uncertainty only nudges the target pose. The catch time and the speed of each move come from the most likely path, as in mean-only.</li>
+      </ul>
+    </div>
+    <p>It could matter more if the uncertainty also set when and how fast the arm moves: a later catch point when the prediction is wide, or a gentler move toward an uncertain target until a bounce settles it. Picking the catch time from the worst case once, at the start, did worse; re-deciding it after the bounce hasn't been tried.</p>
   </section>
 </main>
 </body>
