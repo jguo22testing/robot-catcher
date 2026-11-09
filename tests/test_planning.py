@@ -3,7 +3,7 @@ import numpy as np
 from catcher.ball_sim import simulate
 from catcher.belief import CHI2_3D_90, GaussianBelief, ParticlePredictor, SyntheticPredictor
 from catcher.mujoco_scene import Q_READY, CubicTrajectory, Kinematics, build_model, run_catch
-from catcher.planning import (HedgePlanner, HermiteTrajectory, MeanPlanner, SegmentedReference,
+from catcher.planning import (HermiteTrajectory, MeanPlanner, ReplanPlanner, SegmentedReference,
                               particle_predictor_for, synthetic_predictor_for)
 from catcher.room import box_room, pillar
 from catcher.throws import Throw, sample_stage_throw
@@ -74,20 +74,28 @@ def test_segmented_reference_holds_then_moves_then_holds():
     assert np.allclose(ref(1.9)[0], q1) and np.allclose(ref(10.0)[0], q2)
 
 
-def test_hedge_is_never_slower_in_the_worst_case_than_going_to_the_mean():
+def test_uncertainty_aware_logs_one_choice_per_replan():
     rng = np.random.default_rng(0)
-    planner = HedgePlanner(synthetic_predictor_for(0))
+    planner = ReplanPlanner(synthetic_predictor_for(0))
     checked = 0
     for _ in range(6):
         throw = sample_stage_throw(1, rng)
-        planner_model = build_model(throw.room)
-        run_catch(throw, model=planner_model, planner=planner)
+        run_catch(throw, model=build_model(throw.room), planner=planner)
         if planner.last is not None:
-            assert planner.last.worst_case_time <= planner.last.mean_worst_case_time + 1e-9
-            assert planner.last.n_samples > 1
+            assert len(planner.last.choices) == planner.last.n_replans > 3
+            assert set(planner.last.choices) <= {"mean", "cover", "hold"}
             checked += 1
-            planner.last = None
     assert checked >= 3
+
+
+def test_waiting_costs_a_cycle_so_a_known_outcome_is_committed_to():
+    """With a sharp belief every scenario is resolved now; waiting only delays, so the
+    planner must pick a moving target, never "hold"."""
+    throw = sample_stage_throw(1, np.random.default_rng(0))
+    sharp = synthetic_predictor_for(0, sigma0=0.002, growth=0.005, bounce_sigma=0.0)
+    planner = ReplanPlanner(sharp)
+    run_catch(throw, planner=planner)
+    assert planner.last is not None and "hold" not in planner.last.choices
 
 
 def test_planners_without_uncertainty_match_the_oracle_on_stage1():
@@ -96,7 +104,7 @@ def test_planners_without_uncertainty_match_the_oracle_on_stage1():
     for _ in range(5):
         throw = sample_stage_throw(1, rng)
         model = build_model(throw.room)
-        for planner in (MeanPlanner(exact), HedgePlanner(exact)):
+        for planner in (MeanPlanner(exact), ReplanPlanner(exact, use_uncertainty=False), ReplanPlanner(exact)):
             assert run_catch(throw, model=model, planner=planner).success
 
 
@@ -114,7 +122,7 @@ def test_replanned_reference_is_continuous():
     rng = np.random.default_rng(2)
     throw = sample_stage_throw(2, rng)
     kin = Kinematics(build_model(throw.room))
-    _, ref = HedgePlanner(synthetic_predictor_for(0))(kin, throw, 25.0)
+    _, ref = ReplanPlanner(synthetic_predictor_for(0))(kin, throw, 25.0)
     assert len(ref.segments) > 2
     for t0, _ in ref.segments[1:]:
         before, after = ref(t0 - 1e-7), ref(t0)
@@ -156,12 +164,12 @@ def test_particle_belief_is_calibrated():
     assert abs(np.mean(inside) - 0.9) < 0.07
 
 
-def test_hedge_scores_cover_or_commit_on_a_two_mode_belief():
+def test_uncertainty_aware_choices_on_a_two_mode_belief():
     throw = sample_stage_throw(2, np.random.default_rng(0), pillar="front")
-    planner = HedgePlanner(particle_predictor_for(0))
+    planner = ReplanPlanner(particle_predictor_for(0))
     run_catch(throw, planner=planner)
     assert planner.last is not None and len(planner.last.choices) == planner.last.n_replans
-    assert set(planner.last.choices) <= {"single", "cover", "none"} | {f"mode{i}" for i in range(10)}
+    assert set(planner.last.choices) <= {"mean", "cover", "hold"} | {f"mode{i}" for i in range(10)}
 
 
 def test_particle_belief_plans_on_one_outcome_not_the_average():
@@ -180,10 +188,10 @@ def test_uncertainty_aware_chooses_left_right_or_wait_at_a_blocking_pillar():
     planned = 0
     for _ in range(6):
         throw = sample_stage_throw(1, rng, pillar="blocking")
-        planner = HedgePlanner(particle_predictor_for(0, sigma_v=0.2))
+        planner = ReplanPlanner(particle_predictor_for(0, sigma_v=0.2))
         run_catch(throw, planner=planner)
         if planner.last is not None:  # None: nothing reachable at t_plan, the arm holds
             planned += 1
             seen |= set(planner.last.choices)
     assert planned >= 3
-    assert seen <= {"left", "right", "wait", "none"} and seen & {"left", "right"}
+    assert seen <= {"mean", "left", "right", "cover", "wait"} and seen & {"left", "right", "mean"}

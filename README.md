@@ -26,7 +26,7 @@ uv run pytest      # sanity tests for the ball sim and throw generator
 | `models/kuka_iiwa_14/` | iiwa14 model vendored from [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) (Apache-2.0). |
 | `scripts/simulate_ball.py` | Plot a few throws (3D + side view, bounces, catch points). |
 | `scripts/generate_dataset.py` | Write a stage dataset to `data/*.npz`. |
-| `scripts/run_catch.py` | Simulate one catch and save a GIF, replay it in the MuJoCo viewer (`--viewer`), or `--eval N` for a headless catch rate. `--planner` (`plan-once`, `mean-only` or `uncertainty-aware`) plans on a belief instead of the ground truth; `--predictor`, `--pillar` and `--occlusion` as in `compare_planners.py`. |
+| `scripts/run_catch.py` | Simulate one catch and save a GIF, replay it in the MuJoCo viewer (`--viewer`), or `--eval N` for a headless catch rate. `--planner` (`mean-only` or `uncertainty-aware`) plans on a belief instead of the ground truth; `--predictor`, `--pillar` and `--occlusion` as in `compare_planners.py`. |
 
 ## Bounce Lab (web UI)
 
@@ -97,11 +97,13 @@ draws whole trajectories from it (exact Gaussian marginals at every time, smooth
 
 | Planner | What it does |
 |---|---|
-| plan-once (`MeanPlanner`) | Observes for `t_plan`, then commits once to the earliest reachable belief mean. |
-| uncertainty-aware (`HedgePlanner`) | Fixes the catch time at `t_plan`, then re-plans every 50 ms on the sharper belief until 0.1 s before the catch. Each re-plan samples trajectories from the belief, keeps those inside the 90% ellipsoid at the catch time, solves the catch IK for each, and steers toward the joint configuration that minimizes the worst-case joint-space time to any of them (the per-joint midrange). Each segment is a cubic that starts from the reference's current position and velocity, so the arm never stops between re-plans. mean-only (`HedgePlanner(hedge=False)`) runs the same schedule but steers toward the mean's configuration, ignoring the uncertainty. |
+| mean-only (`ReplanPlanner(use_uncertainty=False)`) | Fixes the catch time at `t_plan`, then re-plans every 50 ms on the sharper belief until 0.1 s before the catch, steering toward the catch pose for the belief's planning path. Each segment is a cubic that starts from the reference's current position and velocity, so the arm never stops between re-plans. |
+| uncertainty-aware (`ReplanPlanner`) | Same schedule, but each re-plan is a scenario-based contingency decision. It draws 64 possible ball positions at the catch time from the belief and solves each one's catch pose. Candidate targets: the mean's pose, the center of each group of scenarios (an outcome, or a side of a blocking pillar), a pose covering all of them, and waiting. Each candidate is scored by the probability weight of scenarios it can still catch: a scenario becomes distinguishable when the shrinking belief spread no longer covers its distance from where the arm is aiming (big corrections are known early, small ones late), and is caught if the arm, heading for the candidate until then, can still reach its catch pose in time. Waiting always gives up at least one re-plan cycle. |
+
+`MeanPlanner` (plan once at `t_plan`) is still in `catcher/planning.py` but no longer compared.
 
 ```bash
-uv run python scripts/compare_planners.py --stage 2 --n 60    # oracle vs plan-once vs mean-only vs uncertainty-aware
+uv run python scripts/compare_planners.py --stage 2 --n 60    # oracle vs mean-only vs uncertainty-aware
 uv run python scripts/run_catch.py --stage 2 --seed 3 --planner uncertainty-aware   # GIF of one belief-based catch
 ```
 
@@ -114,27 +116,24 @@ Two predictors stand in for the trajectory model:
 
 `--pillar` adds a concrete pillar 0.75–1.4 m in front of the robot. `--occlusion` stops the
 belief from sharpening while the pillar or a board hides the ball from a camera behind the robot.
-With several outcomes, the uncertainty-aware planner scores waiting between them ("cover") against
-committing to one and takes the more likely catch. Every planner re-chooses the catch time
-if the predicted ball leaves the catch zone at that time or moves 20 cm from where it was aimed.
+Every planner re-chooses the catch time if the predicted ball leaves the catch zone at that
+time or moves 20 cm from where it was aimed.
 
 Results (60 throws, balls caught and kept in the cup):
 
-| Setup | oracle | plan-once | mean-only | uncertainty-aware |
-|---|---|---|---|---|
-| Stage 2, gaussian | 44 | 8 | 28 | 28 |
-| Stage 2 + pillar, gaussian | 49 | 16 | 31 | 31 |
-| Stage 2 + pillar + occlusion, gaussian | 49 | 16 | 30 | 30 |
-| Stage 2 + pillar, particle | 49 | 29 | 37 | 35 |
-| Stage 2 + pillar + occlusion, particle | 49 | 29 | 37 | 35 |
-| Stage 3 + pillar + occlusion, particle | 40 | 17 | 33 | 30 |
+| Setup | oracle | mean-only | uncertainty-aware |
+|---|---|---|---|
+| Stage 2, gaussian | 44 | 28 | 29 |
+| Stage 2 + pillar, gaussian | 49 | 31 | 34 |
+| Stage 2 + pillar, particle | 49 | 40 | 40 |
+| Stage 2 + pillar + occlusion, particle | 49 | 40 | 40 |
+| Stage 3 + pillar + occlusion, particle | 40 | 33 | 32 |
 
-- Re-planning is still what matters. Using the uncertainty doesn't help: uncertainty-aware
-  ties with mean-only on the Gaussian belief and loses 2–3 catches on the particle belief.
-- With the particle belief, "cover" never scored strictly better than committing to one
-  outcome; it only won ties. Ties now go to the most likely outcome.
-- Occlusion costs at most one catch: when the pillar hides the ball it is mostly before
-  the bounce, while the belief is wide anyway.
+- Re-planning is what matters most. Using the uncertainty adds a little with the Gaussian
+  belief (+1, +3) and ties or loses one with the particle belief. It steers toward the
+  mean's pose in 86–92% of re-plans; the rest are mostly "cover".
+- Occlusion costs nothing here: when the pillar hides the ball it is mostly before the
+  bounce, while the belief is wide anyway.
 - The particle and Gaussian rows aren't a planner comparison: the particle predictor knows
   the room exactly and is sharper after the bounce, which is why every planner does better with it.
 - The arm never touches the room in any of these runs.
@@ -149,22 +148,23 @@ about 2 s to either side, and about 3.9 s to switch sides (joints 1, 3 and 5 eac
 So it has to commit to a side early, and a wrong guess can't be undone. Paths are IK goals plus
 straight joint-space moves, with waypoints when those are blocked (`Kinematics.route`: swing
 the base first, or go back through the tucked pose). With a blocking pillar the
-uncertainty-aware planner chooses left, right or wait each re-plan (`_side_target`).
+uncertainty-aware planner's candidates include each side's center pose and waiting in the
+tucked pose.
 
 Results (stage 1 rooms + blocking pillar, particle belief, 40 throws):
 
-| Velocity error of the estimate | oracle | plan-once | mean-only | uncertainty-aware |
-|---|---|---|---|---|
-| 0.06 m/s | 37 | 5 | 26 | 24 |
-| 0.15 m/s | 37 | 5 | 23 | 18 |
-| 0.3 m/s | 37 | 0 | 9 | 5 |
+| Velocity error of the estimate | oracle | mean-only | uncertainty-aware |
+|---|---|---|---|
+| 0.06 m/s | 37 | 26 | 26 |
+| 0.15 m/s | 37 | 23 | 20 |
+| 0.3 m/s | 37 | 9 | 9 |
 
 The commitment is forced immediately: reaching a side takes about as long as the lob is in the
 air, so there is no slack to wait for information. Committing to the more likely side at once
-is then the best policy, and that is what mean-only does. The uncertainty-aware planner's only
-extra option is to wait, which here can only cost time; its forecast of when the side becomes
-known is also optimistic, so it still waits in 9–17% of re-plans. It could pay off where there
-is slack, e.g. with faster time-scaling of the moves (they are rest-to-rest cubics today).
+is then the best policy, and that is what mean-only does; the uncertainty-aware planner mostly
+agrees (it picks the mean's pose in 82–92% of re-plans and almost never waits). Its options
+could pay off where there is slack, e.g. with faster time-scaling of the moves (they are
+rest-to-rest cubics today).
 
 `docs/pillar_catch.html` (open it in a browser) shows a mean-only catch of a ball bouncing
 off the pillar, with these results.

@@ -22,13 +22,12 @@ import numpy as np
 
 from catcher.mujoco_scene import (N_ARM, add_path_to_scene, build_model, default_camera, ready_pose_clear,
                                   render_frames, run_catch, set_ball)
-from catcher.planning import HedgePlanner, MeanPlanner, particle_predictor_for, synthetic_predictor_for
+from catcher.planning import ReplanPlanner, particle_predictor_for, synthetic_predictor_for
 from catcher.throws import sample_stage_throw
 
 PLANNERS = {"oracle": lambda pf: None,
-            "plan-once": lambda pf: MeanPlanner(pf),
-            "mean-only": lambda pf: HedgePlanner(pf, hedge=False),
-            "uncertainty-aware": lambda pf: HedgePlanner(pf)}
+            "mean-only": lambda pf: ReplanPlanner(pf, use_uncertainty=False),
+            "uncertainty-aware": lambda pf: ReplanPlanner(pf)}
 
 
 def save_gif(frames, path: Path, fps: float):

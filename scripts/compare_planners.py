@@ -1,14 +1,13 @@
 """Compare catch planners on identical throws and identical prediction errors.
 
 oracle:     plans on the ground-truth ball.
-plan-once:  plans once, at t_plan, on the belief's mean (stand-in for the trajectory model).
-mean-only:  re-plans every 50 ms on the sharper belief, steering toward the mean's catch
-            configuration (same schedule as uncertainty-aware, ignoring the uncertainty;
-            isolates what using it adds). HedgePlanner(hedge=False).
-uncertainty-aware: re-plans every 50 ms, steering toward the configuration that minimizes the
-            worst-case joint-space time to any catch configuration in the belief's 90% region.
-            With a multimodal belief it chooses between covering every mode and committing to
-            one. HedgePlanner.
+mean-only:  re-plans every 50 ms on the sharper belief (a stand-in for the trajectory model),
+            steering toward the mean's catch pose; same schedule as uncertainty-aware,
+            ignoring the uncertainty. ReplanPlanner(use_uncertainty=False).
+uncertainty-aware: re-plans every 50 ms, scoring candidate targets (the mean's pose, each
+            outcome's or pillar side's center, a pose covering all, or waiting) against
+            scenarios drawn from the belief, with when each scenario becomes distinguishable.
+            ReplanPlanner.
 
 Beliefs: --predictor gaussian (SyntheticPredictor: one Gaussian, std growing with horizon and
 bounces) or particle (ParticlePredictor: simulated particles, can split into several modes).
@@ -25,7 +24,7 @@ from collections import defaultdict
 import numpy as np
 
 from catcher.mujoco_scene import build_model, ready_pose_clear, run_catch
-from catcher.planning import HedgePlanner, MeanPlanner, particle_predictor_for, synthetic_predictor_for
+from catcher.planning import ReplanPlanner, particle_predictor_for, synthetic_predictor_for
 from catcher.throws import sample_stage_throw
 
 
@@ -55,16 +54,15 @@ def main():
         predictor_for = particle_predictor_for(args.seed, args.occlusion, sigma_v=args.sigma_v)
         belief = f"particle belief (velocity error {args.sigma_v} m/s)"
     planners = {"oracle": None,
-                "plan-once": MeanPlanner(predictor_for, args.t_plan),
-                "mean-only": HedgePlanner(predictor_for, args.t_plan, hedge=False),
-                "uncertainty-aware": HedgePlanner(predictor_for, args.t_plan)}
+                "mean-only": ReplanPlanner(predictor_for, args.t_plan, use_uncertainty=False),
+                "uncertainty-aware": ReplanPlanner(predictor_for, args.t_plan)}
     rng = np.random.default_rng(args.seed)
     caught = {name: [] for name in planners}
     geometric = {name: [] for name in planners}
     contact = {name: [] for name in planners}
     by_bounces = {name: defaultdict(list) for name in planners}
     errors = {name: [] for name in planners}
-    hedge_choices = defaultdict(int)
+    choices = defaultdict(int)
     reselected = {name: 0 for name in planners}
     for _ in range(args.n):
         throw = sample_stage_throw(args.stage, rng, pillar=args.pillar, room_ok=ready_pose_clear)
@@ -76,11 +74,11 @@ def main():
             contact[name].append(r.arm_room_contact)
             by_bounces[name][throw.bounces_before_catch].append(r.success)
             errors[name].append(r.position_error)
-            if isinstance(planner, HedgePlanner) and planner.last is not None:
+            if isinstance(planner, ReplanPlanner) and planner.last is not None:
                 reselected[name] += planner.last.reselections > 0
                 if name == "uncertainty-aware":
                     for c in planner.last.choices:
-                        hedge_choices[c] += 1
+                        choices[c] += 1
                 planner.last = None
 
     extras = ", ".join(x for x, on in ((f"{args.pillar} pillar", args.pillar), ("occlusion", args.occlusion)) if on)
@@ -90,9 +88,9 @@ def main():
         print(f"{name:>17}: caught {sum(caught[name]):2d}/{args.n} (geometric {sum(geometric[name]):2d}), "
               f"median error {100 * np.median(errors[name]):4.1f} cm, arm hit room {sum(contact[name])}  ({per_bounce})"
               + (f", catch time re-chosen in {reselected[name]}" if reselected[name] else ""))
-    if any(c not in ("single",) for c in hedge_choices):
-        total = sum(hedge_choices.values())
-        print("uncertainty-aware re-plans by choice: " + ", ".join(f"{c} {v / total:.0%}" for c, v in sorted(hedge_choices.items())))
+    if choices:
+        total = sum(choices.values())
+        print("uncertainty-aware re-plans by choice: " + ", ".join(f"{c} {v / total:.0%}" for c, v in sorted(choices.items())))
 
 
 if __name__ == "__main__":
