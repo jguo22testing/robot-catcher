@@ -18,14 +18,15 @@ uv run pytest      # sanity tests for the ball sim and throw generator
 
 | File | What it does |
 |---|---|
-| `catcher/room.py` | `Panel` (bounded two-sided rectangle) + `Material` (restitution, friction). `make_room(stage, rng)` builds the procedural room for stages 1–4. Point-cloud sampling and a flat `(P, 13)` panel encoding for the model. |
+| `catcher/room.py` | `Panel` (bounded two-sided rectangle) + `Material` (restitution, friction). `make_room(stage, rng, with_pillar)` builds the procedural room for stages 1–4, optionally with a concrete pillar just in front of the robot. Point-cloud sampling and a flat `(P, 13)` panel encoding for the model. |
 | `catcher/ball_sim.py` | Event-driven point-ball sim. Flight is exact ballistic motion; bounces are found as quadratic roots, so there's no time step and no tunnelling. Bounce: `v_n' = -e v_n`, `v_t' = (1 - friction) v_t`. |
 | `catcher/throws.py` | Catch zone (reach shell around the shoulder), rejection-sampled throws per stage (stage 1: 0 bounces, 2: exactly 1, 3: 1–3, 4: 1–4), Gaussian observation noise, and `generate_dataset` → fixed-shape arrays. |
-| `catcher/mujoco_scene.py` | iiwa14 + cup + room panels built with `MjSpec`; computed-torque joint control driven by either IK + joint-space cubic (`ik`) or differential IK (`diffik`). IK is damped least squares on MuJoCo Jacobians with the cup-axis cone constraint (random restarts on failure). The ball is a mocap body replayed from the NumPy sim. Offscreen rendering helpers. |
+| `catcher/mujoco_scene.py` | iiwa14 + cup + room panels built with `MjSpec`; computed-torque joint control driven by either IK + joint-space cubic (`ik`) or differential IK (`diffik`). IK is damped least squares on MuJoCo Jacobians with the cup-axis cone constraint (random restarts on failure), and rejects poses and joint paths that hit the room. The ball is a free MuJoCo body: replayed from the NumPy sim until it comes within 35 cm of the arm, then simulated, so it can land in the cup, bounce out, or hit the arm. Offscreen rendering helpers. |
+| `catcher/visibility.py` | Camera behind and above the robot; line-of-sight test against boards and pillar faces. |
 | `models/kuka_iiwa_14/` | iiwa14 model vendored from [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) (Apache-2.0). |
 | `scripts/simulate_ball.py` | Plot a few throws (3D + side view, bounces, catch points). |
 | `scripts/generate_dataset.py` | Write a stage dataset to `data/*.npz`. |
-| `scripts/run_catch.py` | Simulate one catch and save a GIF, replay it in the MuJoCo viewer (`--viewer`), or `--eval N` for a headless catch rate. `--planner` (`mean`, `mean-replan` or `hedge`) plans on a synthetic belief instead of the ground truth. |
+| `scripts/run_catch.py` | Simulate one catch and save a GIF, replay it in the MuJoCo viewer (`--viewer`), or `--eval N` for a headless catch rate. `--planner` (`mean`, `mean-replan` or `hedge`) plans on a belief instead of the ground truth; `--predictor`, `--pillar` and `--occlusion` as in `compare_planners.py`. |
 
 ## Bounce Lab (web UI)
 
@@ -54,7 +55,8 @@ throw that never reaches the catch zone has `catch_index` and `bounces_before_ca
 | `webapp/frontend/` | Plain HTML/CSS/JS with Three.js (vendored, so it works offline). |
 
 Limits: surfaces are flat rectangles (no curved geometry yet), and the ball ignores
-the robot, so it passes through the base and catch zone. The arm is only in the MuJoCo sim.
+the robot, so it passes through the base and catch zone. The arm is only in the MuJoCo sim,
+where the ball is simulated once it comes near the arm.
 
 ## Usage
 
@@ -103,23 +105,39 @@ uv run python scripts/compare_planners.py --stage 2 --n 60    # oracle vs mean v
 uv run python scripts/run_catch.py --stage 2 --seed 3 --planner hedge   # GIF of one belief-based catch
 ```
 
-Catch rates with the default synthetic belief (std 5 mm + 6 cm/s of horizon + 3 cm per bounce ahead,
-planning at t = 0.1 s):
+Two predictors stand in for the trajectory model:
 
-| Planner | Stage 1 (40) | Stage 2 (60) | Stage 3 (40) |
-|---|---|---|---|
-| oracle (ground truth) | 39 | 48 | 32 |
-| mean (plans once) | 8 | 5 | 1 |
-| mean-replan | 37 | 30 | 16 |
-| hedge | 37 | 29 | 18 |
+| Predictor | What it is |
+|---|---|
+| `SyntheticPredictor` (`--predictor gaussian`) | One Gaussian: std 5 mm + 6 cm per second of horizon + 3 cm per bounce ahead. |
+| `ParticlePredictor` (`--predictor particle`) | 96 simulated balls from a noisy estimate of the ball's state at its last sighting (5 mm, 6 cm/s), each with slightly perturbed bounce materials. It can split into several outcomes (e.g. the ball clips a pillar edge or misses it); `ParticleBelief.modes` groups particles by the surfaces they bounce off. Planners use the most likely outcome's path, not the overall mean, which can lie between outcomes. |
 
-Re-planning is what matters: planning once leaves 5-15 cm of belief std at the catch, more than
-the 5.25 cm the cup allows. Hedging on top of re-planning is a wash so far (+2 on stage 3, -1 on
-stage 2). The remaining misses are timing, not tracking: the controller follows the reference to
-within a few mm, but the catch time is the earliest one the mean can reach, so a late correction
-can't finish in time. Choosing a later catch time that covers the whole 90% ellipsoid was tried
-and did worse (18/60 on stage 2): before the bounce the ellipsoid is wide, so it pushed catches
-late into the throw.
+`--pillar` adds a concrete pillar 0.75–1.4 m in front of the robot. `--occlusion` stops the
+belief from sharpening while the pillar or a board hides the ball from a camera behind the robot.
+With several outcomes, the hedge planner scores waiting between them ("cover") against
+committing to one and takes the more likely catch. Every planner re-chooses the catch time
+if the predicted ball leaves the catch zone at that time or moves 20 cm from where it was aimed.
+
+Results (60 throws, balls caught and kept in the cup):
+
+| Setup | oracle | mean | mean-replan | hedge |
+|---|---|---|---|---|
+| Stage 2, gaussian | 44 | 8 | 28 | 28 |
+| Stage 2 + pillar, gaussian | 49 | 16 | 31 | 31 |
+| Stage 2 + pillar + occlusion, gaussian | 49 | 16 | 30 | 30 |
+| Stage 2 + pillar, particle | 49 | 29 | 37 | 35 |
+| Stage 2 + pillar + occlusion, particle | 49 | 29 | 37 | 35 |
+| Stage 3 + pillar + occlusion, particle | 40 | 17 | 33 | 30 |
+
+- Re-planning is still what matters. Hedging doesn't help: it ties with the Gaussian belief
+  and loses 2–3 catches with the particle belief.
+- With the particle belief, "cover" never scored strictly better than committing to one
+  outcome; it only won ties. Ties now go to the most likely outcome.
+- Occlusion costs at most one catch: when the pillar hides the ball it is mostly before
+  the bounce, while the belief is wide anyway.
+- The particle and Gaussian rows aren't a planner comparison: the particle predictor knows
+  the room exactly and is sharper after the bounce, which is why every planner does better with it.
+- The arm never touches the room in any of these runs.
 
 Catches are always scored against the true ball. `run_catch(planner=...)` takes any
 `(kin, throw, cone_deg) -> (catch index, joint reference)` callable.
@@ -129,11 +147,15 @@ Catches are always scored against the true ball. `run_catch(planner=...)` takes 
 - World frame: iiwa base at the origin, z up, thrower on the +x side of the room.
 - The iiwa14 joint velocity/torque limits come from the KUKA spec sheet
   (`VELOCITY_LIMITS`, `TORQUE_LIMITS`); the Menagerie model doesn't include them.
-  Arm contacts are disabled since the ball isn't a MuJoCo body yet.
+- Contacts in MuJoCo: arm–room, ball–room and ball–arm (including the cup); the arm never
+  collides with itself. The cup is 1 cm thick with a stiff, overdamped contact (a padded
+  cup): with MuJoCo's default soft contact a 7 m/s ball sinks straight through it.
 - The default room is x ∈ [-1.5, 4.5], y ∈ [-3, 3], z ∈ [0, 3] (stage 4 randomizes it).
 - Observations at 100 Hz over 3 s (300 samples), noise σ = 5 mm by default.
-- A catch counts if, at the catch time, the ball is within the cup radius of the
-  cup center and the cup axis is within 30° of the incoming ball direction (−v).
+- A catch counts if the simulated ball is still inside the cup at the end of the run
+  (0.5 s after the catch time). The older geometric check is kept as `geometric_success`:
+  at the catch time the ball is within the cup radius of the cup center and the cup axis
+  is within 30° of the incoming ball direction (−v).
 
 ## Dataset arrays (`generate_dataset`)
 
@@ -144,11 +166,14 @@ wall point cloud, `catch_index (N,)`, `bounces_before_catch (N,)`,
 
 ## Current oracle catch rates (ground-truth target, `ik` controller, 40 throws)
 
+A catch is the simulated ball staying in the cup; the old geometric check is in brackets.
+
 | Stage | 1 | 2 | 3 | 4 |
 |---|---|---|---|---|
-| Caught | 39/40 | 33/40 | 32/40 | 33/40 |
+| Caught | 40/40 (39) | 30/40 (31) | 18/40 (18) | 21/40 (25) |
 
 Misses are mostly throws that reach the workspace faster than the arm can
-reorient (often balls coming off the back wall, from behind the robot).
-`diffik` toward a fixed pose drops further on bounce stages (25/40 on stage 2):
-straight-line Cartesian motion is slower and stalls when the arm needs to flip.
+reorient, and on stages 3–4 balls that are still rising when they reach the robot:
+the cup would have to face down to meet them, so the planner only aims at descending
+balls. `diffik` toward a fixed pose catches 26/40 on stage 2. The evaluation scripts skip
+rooms where a random board passes through the robot's ready pose.

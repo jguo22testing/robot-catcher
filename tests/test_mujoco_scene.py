@@ -1,7 +1,8 @@
 import numpy as np
 
 from catcher.ball_sim import simulate
-from catcher.mujoco_scene import Q_READY, CubicTrajectory, Kinematics, build_model, run_catch, solve_catch_ik
+from catcher.mujoco_scene import (Q_READY, CubicTrajectory, Kinematics, build_model, plan_ik_catch, ready_pose_clear,
+                                  run_catch, solve_catch_ik)
 from catcher.room import box_room, pillar, random_pillar
 from catcher.throws import Throw, sample_stage_throw
 
@@ -83,3 +84,20 @@ def test_catch_ik_avoids_the_pillar():
         q, ok = solve_catch_ik(kin, p, np.array([-4.0, 0.0, -3.0]), Q_READY, 25, restarts=4)
         if ok:
             assert not kin.collides(q)
+
+
+def test_planner_only_aims_at_descending_balls():
+    rng = np.random.default_rng(0)
+    for _ in range(10):
+        throw = sample_stage_throw(3, rng)
+        kin = Kinematics(build_model(throw.room))
+        k, traj = plan_ik_catch(kin, throw, 25)
+        if not np.array_equal(traj.q0, traj.q1):
+            assert throw.vel[k, 2] < 0
+
+
+def test_rooms_with_a_board_through_the_robot_can_be_skipped():
+    room = box_room()
+    assert ready_pose_clear(room)
+    room.panels += pillar((0.6, 0.0), 0.1, room)
+    assert not ready_pose_clear(room)

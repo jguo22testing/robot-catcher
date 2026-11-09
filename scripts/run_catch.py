@@ -9,8 +9,9 @@ Replay it in the interactive viewer (macOS needs `mjpython` instead of `python`)
 Headless batch evaluation (oracle catch rate):
     python scripts/run_catch.py --stage 2 --eval 50 [--controller diffik]
 
-Plan on a noisy belief instead of the ground truth (see catcher.planning):
-    python scripts/run_catch.py --stage 2 --seed 3 --planner hedge
+Plan on a noisy belief instead of the ground truth (see catcher.planning), optionally with
+a pillar in front of the robot, occlusion, and the multimodal particle belief:
+    python scripts/run_catch.py --stage 2 --seed 3 --planner hedge [--pillar] [--occlusion] [--predictor particle]
 """
 
 import argparse
@@ -19,15 +20,15 @@ from pathlib import Path
 
 import numpy as np
 
-from catcher.mujoco_scene import (N_ARM, add_path_to_scene, build_model, default_camera, render_frames, run_catch,
-                                  set_ball)
-from catcher.planning import HedgePlanner, MeanPlanner, synthetic_predictor_for
+from catcher.mujoco_scene import (N_ARM, add_path_to_scene, build_model, default_camera, ready_pose_clear,
+                                  render_frames, run_catch, set_ball)
+from catcher.planning import HedgePlanner, MeanPlanner, particle_predictor_for, synthetic_predictor_for
 from catcher.throws import sample_stage_throw
 
-PLANNERS = {"oracle": lambda: None,
-            "mean": lambda: MeanPlanner(synthetic_predictor_for()),
-            "mean-replan": lambda: HedgePlanner(synthetic_predictor_for(), hedge=False),
-            "hedge": lambda: HedgePlanner(synthetic_predictor_for())}
+PLANNERS = {"oracle": lambda pf: None,
+            "mean": lambda pf: MeanPlanner(pf),
+            "mean-replan": lambda pf: HedgePlanner(pf, hedge=False),
+            "hedge": lambda pf: HedgePlanner(pf)}
 
 
 def save_gif(frames, path: Path, fps: float):
@@ -69,33 +70,40 @@ def main():
     ap.add_argument("--controller", choices=["ik", "diffik"], default="ik")
     ap.add_argument("--planner", choices=list(PLANNERS), default="oracle",
                     help="plan on the ground truth (oracle) or on a synthetic belief")
+    ap.add_argument("--predictor", choices=["gaussian", "particle"], default="gaussian")
+    ap.add_argument("--pillar", action="store_true", help="add a pillar just in front of the robot")
+    ap.add_argument("--occlusion", action="store_true", help="the belief only sharpens while the ball is visible")
     ap.add_argument("--eval", type=int, default=0, help="run N throws headless and report the catch rate")
     ap.add_argument("--viewer", action="store_true", help="replay in the MuJoCo viewer (use mjpython on macOS)")
     ap.add_argument("--out", type=str, default=None, help="GIF path (default outputs/catch_stage{S}_seed{N}.gif)")
     args = ap.parse_args()
 
     rng = np.random.default_rng(args.seed)
-    planner = PLANNERS[args.planner]()
+    factory = particle_predictor_for if args.predictor == "particle" else synthetic_predictor_for
+    planner = PLANNERS[args.planner](factory(0, args.occlusion))
     label = args.controller if planner is None else args.planner
     if args.eval:
-        results = [run_catch(sample_stage_throw(args.stage, rng), controller=args.controller, planner=planner)
-                   for _ in range(args.eval)]
+        results = [run_catch(sample_stage_throw(args.stage, rng, with_pillar=args.pillar, room_ok=ready_pose_clear),
+                             controller=args.controller,
+                             planner=planner) for _ in range(args.eval)]
         errs = np.array([r.position_error for r in results])
-        print(f"stage {args.stage} / {label}: caught {sum(r.success for r in results)}/{args.eval}, "
-              f"median position error {100 * np.median(errs):.1f} cm")
+        print(f"stage {args.stage} / {label}: caught {sum(r.success for r in results)}/{args.eval} "
+              f"(geometric {sum(r.geometric_success for r in results)}), "
+              f"median position error {100 * np.median(errs):.1f} cm, arm hit room {sum(r.arm_room_contact for r in results)}")
         return
 
-    throw = sample_stage_throw(args.stage, rng)
+    throw = sample_stage_throw(args.stage, rng, with_pillar=args.pillar, room_ok=ready_pose_clear)
     model = build_model(throw.room)
     r = run_catch(throw, model=model, controller=args.controller, planner=planner)
     print(f"bounces before catch: {throw.bounces_before_catch}, catch time {r.t_catch:.2f}s")
-    print(f"cup-ball error {100 * r.position_error:.1f} cm, axis angle {r.axis_angle_deg:.0f} deg "
-          f"-> {'CAUGHT' if r.success else 'MISSED'}")
+    print(f"cup-ball error {100 * r.position_error:.1f} cm, axis angle {r.axis_angle_deg:.0f} deg, "
+          f"ball {'stayed in the cup -> CAUGHT' if r.success else 'not in the cup at the end -> MISSED'}"
+          f"{', arm hit the room' if r.arm_room_contact else ''}")
     path_points = throw.pos[throw.times <= r.times[-1]]
     if args.viewer:
         replay_in_viewer(model, r, path_points)
         return
-    suffix = "" if planner is None else f"_{args.planner}"
+    suffix = ("_pillar" if args.pillar else "") + ("" if planner is None else f"_{args.planner}")
     out = Path(args.out or f"outputs/catch_stage{args.stage}_seed{args.seed}{suffix}.gif")
     fps = 1.0 / np.diff(r.times).mean()
     save_gif(render_frames(model, r, path_points), out, fps)

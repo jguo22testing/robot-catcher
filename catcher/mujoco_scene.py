@@ -30,6 +30,7 @@ FLANGE_Z = 0.045  # link 7 flange (Menagerie "attachment_site")
 BALL_RADIUS = 0.035  # MuJoCo ball radius; the NumPy simulator treats the ball as a point
 BALL_MASS = 0.057  # tennis ball
 RELEASE_DIST = 0.35  # hand the ball to MuJoCo once it is this close to any arm link origin
+MIN_DESCENT = 0.0  # catch only where the ball descends: v_z / |v| below -MIN_DESCENT
 PANEL_THICKNESS = 0.02
 
 # KUKA LBR iiwa 14 R820 spec-sheet limits (the Menagerie model doesn't include them).
@@ -112,6 +113,12 @@ def build_model(room: Room | None = None) -> mujoco.MjModel:
 
 
 ARM_BODIES = [f"link{i}" for i in range(1, 8)]
+
+
+def ready_pose_clear(room: Room) -> bool:
+    """Whether the arm in its ready pose is clear of the room. Random boards are placed
+    without regard to the robot and sometimes pass through it."""
+    return not Kinematics(build_model(room)).collides(Q_READY)
 
 
 def set_ball(data: mujoco.MjData, pos: np.ndarray, vel: np.ndarray | None = None):
@@ -287,19 +294,22 @@ class DiffIKReference:
 
 def plan_ik_catch(kin: Kinematics, throw: Throw, cone_half_angle_deg: float,
                   stride: int = 2, max_candidates: int = 40, belief=None,
-                  q_start: np.ndarray = Q_READY, t_start: float = 0.0):
+                  q_start: np.ndarray = Q_READY, t_start: float = 0.0, min_descent: float = MIN_DESCENT):
     """Catch plan: the earliest in-workspace ball sample the arm can reach in time
     (or the least-late one if none), skipping targets whose joint path hits the room.
-    Returns (index, joint trajectory).
+    Only points where the ball is coming down (v_z / |v| < -min_descent) count: the cup
+    faces the incoming ball, so a rising ball would need an upside-down cup, and the ball
+    falls back out of it. Returns (index, joint trajectory).
 
-    By default it plans on the ground truth (the oracle). With a `belief` (a
-    GaussianBelief over the throw's time grid) it aims at the belief mean instead.
+    By default it plans on the ground truth (the oracle). With a `belief` (see
+    catcher.belief) it aims at the belief's planning path (`plan_mean`) instead.
     The motion starts from rest at q_start at time t_start; the returned trajectory
     runs on time relative to t_start.
     """
-    pos, vel = (throw.pos, throw.vel) if belief is None else (belief.mean, belief.vel)
+    pos, vel = (throw.pos, throw.vel) if belief is None else (belief.plan_mean, belief.plan_vel)
     best = None
-    candidates = np.flatnonzero(in_catch_zone(pos) & (throw.times > t_start))[::stride][:max_candidates]
+    descending = vel[:, 2] < -min_descent * np.linalg.norm(vel, axis=1)
+    candidates = np.flatnonzero(in_catch_zone(pos) & descending & (throw.times > t_start))[::stride][:max_candidates]
     # Cheap pass from the start pose first; random restarts only if nothing was reachable.
     for restarts in (0, 8):
         for k in candidates[::1 if restarts == 0 else 3]:

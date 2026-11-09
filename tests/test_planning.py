@@ -1,9 +1,12 @@
 import numpy as np
 
-from catcher.belief import CHI2_3D_90, GaussianBelief, SyntheticPredictor
+from catcher.ball_sim import simulate
+from catcher.belief import CHI2_3D_90, GaussianBelief, ParticlePredictor, SyntheticPredictor
 from catcher.mujoco_scene import Q_READY, CubicTrajectory, Kinematics, build_model, run_catch
-from catcher.planning import HedgePlanner, HermiteTrajectory, MeanPlanner, SegmentedReference, synthetic_predictor_for
-from catcher.throws import sample_stage_throw
+from catcher.planning import (HedgePlanner, HermiteTrajectory, MeanPlanner, SegmentedReference,
+                              particle_predictor_for, synthetic_predictor_for)
+from catcher.room import box_room, pillar
+from catcher.throws import Throw, sample_stage_throw
 
 
 def _flat_belief(std=0.1, n_steps=300, corr_time=0.3):
@@ -116,3 +119,56 @@ def test_replanned_reference_is_continuous():
     for t0, _ in ref.segments[1:]:
         before, after = ref(t0 - 1e-7), ref(t0)
         assert np.allclose(before[0], after[0], atol=1e-4) and np.allclose(before[1], after[1], atol=1e-2)
+
+
+def _edge_throw(y0):
+    """A ball flying in -x at height 1.2 m toward a pillar whose +y edge is at y = 0.15."""
+    room = box_room()
+    room.panels += pillar((2.0, 0.0), 0.15, room)
+    p0, v0 = np.array([3.5, y0, 1.2]), np.array([-6.0, 0.0, 1.0])
+    traj = simulate(room, p0, v0, t_end=1.0)
+    times = np.arange(0.0, 1.0, 0.01)
+    pos, vel = traj.sample(times)
+    return Throw(room, p0, v0, traj, times, pos, vel, len(times) - 1, len(traj.bounces))
+
+
+def test_particle_belief_splits_at_a_pillar_edge():
+    throw = _edge_throw(0.15)  # straight at the edge
+    modes = ParticlePredictor(throw, seed=0)(0.0).modes(70, 16, np.random.default_rng(0))
+    assert len(modes) == 2 and min(m.weight for m in modes) > 0.2
+    assert abs(sum(m.weight for m in modes) - 1) < 1e-9
+    assert all(0.2 < m.split_time < 0.35 for m in modes)  # the ball reaches the pillar at ~0.23 s
+    assert np.linalg.norm(modes[0].mean - modes[1].mean) > 0.5
+
+
+def test_particle_belief_has_one_mode_far_from_any_edge():
+    modes = ParticlePredictor(_edge_throw(0.6), seed=0)(0.0).modes(70, 16, np.random.default_rng(0))
+    assert len(modes) == 1 and modes[0].weight == 1.0 and np.isinf(modes[0].split_time)
+
+
+def test_particle_belief_is_calibrated():
+    throw = sample_stage_throw(1, np.random.default_rng(1))
+    k = throw.catch_index
+    inside = []
+    for s in range(150):
+        belief = ParticlePredictor(throw, n=64, seed=s)(0.1)  # stage 1: no bounce, a single mode
+        inside.append(belief.mahalanobis_sq(k, throw.pos[k]) <= CHI2_3D_90)
+    assert abs(np.mean(inside) - 0.9) < 0.07
+
+
+def test_hedge_scores_cover_or_commit_on_a_two_mode_belief():
+    throw = sample_stage_throw(2, np.random.default_rng(0), with_pillar=True)
+    planner = HedgePlanner(particle_predictor_for(0))
+    run_catch(throw, planner=planner)
+    assert planner.last is not None and len(planner.last.choices) == planner.last.n_replans
+    assert set(planner.last.choices) <= {"single", "cover", "none"} | {f"mode{i}" for i in range(10)}
+
+
+def test_particle_belief_plans_on_one_outcome_not_the_average():
+    belief = ParticlePredictor(_edge_throw(0.15), seed=0)(0.0)
+    modes = belief.modes(70)
+    assert len(modes) == 2
+    gap = np.linalg.norm(modes[0].mean - modes[1].mean)
+    to_nearest_mode = min(np.linalg.norm(belief.plan_mean[70] - m.mean) for m in modes)
+    assert to_nearest_mode < 0.1 * gap
+    assert min(np.linalg.norm(belief.mean[70] - m.mean) for m in modes) > 0.2 * gap
