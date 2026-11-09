@@ -455,10 +455,10 @@ def add_path_to_scene(scene: mujoco.MjvScene, points: np.ndarray, rgba=(1.0, 0.4
 
 
 def render_frames(model: mujoco.MjModel, result: CatchResult, path_points: np.ndarray,
-                  height: int = 480, width: int = 640) -> list[np.ndarray]:
+                  height: int = 480, width: int = 640, camera: mujoco.MjvCamera | None = None) -> list[np.ndarray]:
     """Offscreen-render the logged arm motion and ball."""
     data = mujoco.MjData(model)
-    cam = default_camera()
+    cam = camera or default_camera()
     frames = []
     with mujoco.Renderer(model, height, width) as renderer:
         for q, p in zip(result.q, result.ball):
