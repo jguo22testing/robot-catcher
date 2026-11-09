@@ -71,7 +71,8 @@ def main():
     ap.add_argument("--planner", choices=list(PLANNERS), default="oracle",
                     help="plan on the ground truth (oracle) or on a synthetic belief")
     ap.add_argument("--predictor", choices=["gaussian", "particle"], default="gaussian")
-    ap.add_argument("--pillar", action="store_true", help="add a pillar just in front of the robot")
+    ap.add_argument("--pillar", choices=["front", "blocking"], default=None,
+                    help="front: pillar 0.75-1.4 m out; blocking: straight ahead, the arm must go left or right of it")
     ap.add_argument("--occlusion", action="store_true", help="the belief only sharpens while the ball is visible")
     ap.add_argument("--eval", type=int, default=0, help="run N throws headless and report the catch rate")
     ap.add_argument("--viewer", action="store_true", help="replay in the MuJoCo viewer (use mjpython on macOS)")
@@ -83,7 +84,7 @@ def main():
     planner = PLANNERS[args.planner](factory(0, args.occlusion))
     label = args.controller if planner is None else args.planner
     if args.eval:
-        results = [run_catch(sample_stage_throw(args.stage, rng, with_pillar=args.pillar, room_ok=ready_pose_clear),
+        results = [run_catch(sample_stage_throw(args.stage, rng, pillar=args.pillar, room_ok=ready_pose_clear),
                              controller=args.controller,
                              planner=planner) for _ in range(args.eval)]
         errs = np.array([r.position_error for r in results])
@@ -92,7 +93,7 @@ def main():
               f"median position error {100 * np.median(errs):.1f} cm, arm hit room {sum(r.arm_room_contact for r in results)}")
         return
 
-    throw = sample_stage_throw(args.stage, rng, with_pillar=args.pillar, room_ok=ready_pose_clear)
+    throw = sample_stage_throw(args.stage, rng, pillar=args.pillar, room_ok=ready_pose_clear)
     model = build_model(throw.room)
     r = run_catch(throw, model=model, controller=args.controller, planner=planner)
     print(f"bounces before catch: {throw.bounces_before_catch}, catch time {r.t_catch:.2f}s")
@@ -103,7 +104,7 @@ def main():
     if args.viewer:
         replay_in_viewer(model, r, path_points)
         return
-    suffix = ("_pillar" if args.pillar else "") + ("" if planner is None else f"_{args.planner}")
+    suffix = (f"_pillar-{args.pillar}" if args.pillar else "") + ("" if planner is None else f"_{args.planner}")
     out = Path(args.out or f"outputs/catch_stage{args.stage}_seed{args.seed}{suffix}.gif")
     fps = 1.0 / np.diff(r.times).mean()
     save_gif(render_frames(model, r, path_points), out, fps)

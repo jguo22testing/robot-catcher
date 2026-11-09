@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .ball_sim import GRAVITY, BallTrajectory, simulate
-from .room import Room, make_room
+from .room import Room, make_room, pillar_footprint
 
 # Catch zone: a spherical shell around the iiwa shoulder that the cup can reach
 # with some margin, cut off near the floor.
@@ -94,18 +94,54 @@ def sample_throw(room: Room, rng: np.random.Generator, min_bounces: int = 0, max
     raise RuntimeError("could not sample a valid throw; loosen the constraints")
 
 
+def sample_throw_beside_pillar(room: Room, rng: np.random.Generator, t_end: float = 3.0,
+                               max_tries: int = 5000) -> Throw:
+    """A direct lob that passes just to the left or right of a blocking pillar (random side),
+    11-25 cm from its face, and reaches the catch zone without bouncing."""
+    center, half = pillar_footprint(room)
+    times = np.arange(0.0, t_end, 1.0 / OBS_RATE_HZ)
+    for _ in range(max_tries):
+        side = rng.choice([-1.0, 1.0])
+        target = np.array([center[0] + rng.uniform(-0.04, 0.06),
+                           center[1] + side * (half + rng.uniform(0.11, 0.25)),
+                           rng.uniform(0.55, 0.95)])
+        if not in_catch_zone(target):
+            continue
+        p0 = rng.uniform(THROW_LO, THROW_HI)
+        flight_time = rng.uniform(1.6, 2.1)  # high lobs: reaching around the pillar takes ~1.5-2 s
+        v0 = _velocity_to_hit(p0, target, flight_time)
+        if np.linalg.norm(v0) > MAX_THROW_SPEED:
+            continue
+        traj = simulate(room, p0, v0, t_end=t_end)
+        if traj.num_bounces_before(flight_time + 0.05):
+            continue  # clipped the pillar or a board on the way
+        pos, vel = traj.sample(times)
+        ci = first_catchable_index(pos)
+        if ci is not None:
+            return Throw(room, p0, v0, traj, times, pos, vel, ci, 0)
+    raise RuntimeError("could not sample a throw past the pillar")
+
+
 STAGE_BOUNCES = {1: (0, 0), 2: (1, 1), 3: (1, 3), 4: (1, 4)}
 
 
 def sample_stage_throw(stage: int, rng: np.random.Generator, t_end: float = 3.0,
-                       with_pillar: bool = False, room_ok=None) -> Throw:
-    """A throw for a stage. room_ok (Room -> bool) rejects rooms, e.g. ones whose boards pass
-    through the robot (mujoco_scene.ready_pose_clear); datasets don't use it."""
+                       pillar: str | None = None, room_ok=None) -> Throw:
+    """A throw for a stage, optionally in a room with a pillar ("front" or "blocking").
+    With a blocking pillar the throw is a direct lob past one side of it
+    (sample_throw_beside_pillar); the stage still sets the room's boards. room_ok
+    (Room -> bool) rejects rooms, e.g. ones whose boards pass through the robot
+    (mujoco_scene.ready_pose_clear); datasets don't use it."""
     lo, hi = STAGE_BOUNCES[stage]
     for _ in range(50):  # resample the room if it makes valid throws too rare
-        room = make_room(stage, rng, with_pillar)
+        room = make_room(stage, rng, pillar)
         if room_ok is not None and not room_ok(room):
             continue
+        if pillar == "blocking":
+            try:
+                return sample_throw_beside_pillar(room, rng, t_end, max_tries=2000)
+            except RuntimeError:
+                continue
         try:
             return sample_throw(room, rng, lo, hi, t_end=t_end, max_tries=2000)
         except RuntimeError:

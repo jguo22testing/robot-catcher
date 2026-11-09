@@ -168,12 +168,29 @@ def pillar(center_xy, half_size: float, room: Room, material: Material | None = 
     return faces
 
 
-def random_pillar(rng: np.random.Generator, room: Room) -> list[Panel]:
-    """A pillar just in front of the robot, between it and the thrower. Its near face is at
-    x >= 0.75 m: the ready-pose cup reaches x = 0.69 m (rim included), so the arm clears
-    the pillar in the ready pose but not in every catch pose."""
-    half = rng.uniform(0.08, 0.15)
-    center = (rng.uniform(0.75 + half, 1.25), rng.uniform(-0.5, 0.5))
+PILLAR_PLACEMENTS = ("front", "blocking")
+BLOCKING_CEILING = 7.0
+
+
+def random_pillar(rng: np.random.Generator, room: Room, placement: str = "front") -> list[Panel]:
+    """A pillar between the robot and the thrower.
+
+    "front": 0.75-1.4 m out. Its near face is at x >= 0.75 m: the ready-pose cup reaches
+    x = 0.69 m (rim included), so the arm clears the pillar in the ready pose but not in
+    every catch pose.
+    "blocking": straight ahead, inside the arm's reach (center x 0.48-0.55 m, |y| <= 0.05,
+    half-width 0.07-0.11 m). The arm has to reach around it on the left or the right, the
+    pose halfway between the two sides is inside it, and going from one side to the other
+    means backing out around it, so the arm has to commit to a side.
+    """
+    if placement == "front":
+        half = rng.uniform(0.08, 0.15)
+        center = (rng.uniform(0.75 + half, 1.25), rng.uniform(-0.5, 0.5))
+    elif placement == "blocking":
+        half = rng.uniform(0.07, 0.11)
+        center = (rng.uniform(0.48, 0.55), rng.uniform(-0.05, 0.05))
+    else:
+        raise ValueError(f"unknown pillar placement {placement!r}; expected one of {PILLAR_PLACEMENTS}")
     return pillar(center, half, room)
 
 
@@ -181,7 +198,24 @@ def is_pillar(panel: Panel) -> bool:
     return panel.name.startswith("pillar")
 
 
-def make_room(stage: int, rng: np.random.Generator, with_pillar: bool = False) -> Room:
+BLOCKING_PILLAR_MAX_X = 0.75  # a pillar centered closer than this to the robot is inside the arm's reach
+
+
+def pillar_footprint(room: Room) -> tuple[np.ndarray, float] | None:
+    """(center xy, half-width) of the room's pillar, or None if it has none."""
+    faces = [p for p in room.panels if is_pillar(p)]
+    if not faces:
+        return None
+    return np.mean([f.center[:2] for f in faces], axis=0), float(faces[0].half_extents[0])
+
+
+def blocking_pillar_footprint(room: Room) -> tuple[np.ndarray, float] | None:
+    """pillar_footprint, if the pillar is inside the arm's reach."""
+    fp = pillar_footprint(room)
+    return fp if fp is not None and fp[0][0] < BLOCKING_PILLAR_MAX_X else None
+
+
+def make_room(stage: int, rng: np.random.Generator, pillar_placement: str | None = None) -> Room:
     """Procedural room for each project stage.
 
     1: plain box room (throws go straight to the robot).
@@ -189,25 +223,33 @@ def make_room(stage: int, rng: np.random.Generator, with_pillar: bool = False) -
     3: box room + 1-3 boards with fully randomized restitution/friction.
     4: randomized room dimensions + 2-4 random boards.
 
-    with_pillar adds a concrete pillar just in front of the robot (random_pillar).
+    pillar_placement ("front" or "blocking") adds a concrete pillar (random_pillar). A room
+    with a blocking pillar gets a 7 m ceiling (a gym or warehouse): reaching around the
+    pillar takes the arm 1.5-2 s, and a lob that stays under a 3 m ceiling is in the air
+    for at most about 1.3 s.
     """
+    lo, hi = np.array([-1.5, -3.0, 0.0]), np.array([4.5, 3.0, 3.0])
+    if pillar_placement == "blocking":
+        hi[2] = BLOCKING_CEILING
     if stage == 1:
-        room = box_room()
+        room = box_room(lo, hi)
     elif stage == 2:
-        room = box_room()
+        room = box_room(lo, hi)
         room.panels.append(random_board(rng, room, "board_0"))
     elif stage == 3:
-        room = box_room()
+        room = box_room(lo, hi)
         for i in range(rng.integers(1, 4)):
             room.panels.append(random_board(rng, room, f"board_{i}", random_restitution=True))
     elif stage == 4:
         lo = np.array([-rng.uniform(1.0, 2.0), -rng.uniform(2.0, 4.0), 0.0])
         hi = np.array([rng.uniform(4.0, 6.0), rng.uniform(2.0, 4.0), rng.uniform(2.5, 4.0)])
+        if pillar_placement == "blocking":
+            hi[2] = max(hi[2], BLOCKING_CEILING)
         room = box_room(lo, hi)
         for i in range(rng.integers(2, 5)):
             room.panels.append(random_board(rng, room, f"board_{i}", random_restitution=True))
     else:
         raise ValueError(f"unknown stage {stage}")
-    if with_pillar:
-        room.panels.extend(random_pillar(rng, room))
+    if pillar_placement is not None:
+        room.panels.extend(random_pillar(rng, room, pillar_placement))
     return room

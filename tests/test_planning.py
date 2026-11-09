@@ -157,7 +157,7 @@ def test_particle_belief_is_calibrated():
 
 
 def test_hedge_scores_cover_or_commit_on_a_two_mode_belief():
-    throw = sample_stage_throw(2, np.random.default_rng(0), with_pillar=True)
+    throw = sample_stage_throw(2, np.random.default_rng(0), pillar="front")
     planner = HedgePlanner(particle_predictor_for(0))
     run_catch(throw, planner=planner)
     assert planner.last is not None and len(planner.last.choices) == planner.last.n_replans
@@ -172,3 +172,18 @@ def test_particle_belief_plans_on_one_outcome_not_the_average():
     to_nearest_mode = min(np.linalg.norm(belief.plan_mean[70] - m.mean) for m in modes)
     assert to_nearest_mode < 0.1 * gap
     assert min(np.linalg.norm(belief.mean[70] - m.mean) for m in modes) > 0.2 * gap
+
+
+def test_uncertainty_aware_chooses_left_right_or_wait_at_a_blocking_pillar():
+    rng = np.random.default_rng(0)
+    seen = set()
+    planned = 0
+    for _ in range(6):
+        throw = sample_stage_throw(1, rng, pillar="blocking")
+        planner = HedgePlanner(particle_predictor_for(0, sigma_v=0.2))
+        run_catch(throw, planner=planner)
+        if planner.last is not None:  # None: nothing reachable at t_plan, the arm holds
+            planned += 1
+            seen |= set(planner.last.choices)
+    assert planned >= 3
+    assert seen <= {"left", "right", "wait", "none"} and seen & {"left", "right"}

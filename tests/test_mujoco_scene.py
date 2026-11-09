@@ -1,10 +1,10 @@
 import numpy as np
 
 from catcher.ball_sim import simulate
-from catcher.mujoco_scene import (Q_READY, CubicTrajectory, Kinematics, build_model, plan_ik_catch, ready_pose_clear,
+from catcher.mujoco_scene import (Q_READY, Q_TUCKED, CubicTrajectory, Kinematics, build_model, plan_ik_catch, ready_pose_clear,
                                   run_catch, solve_catch_ik)
 from catcher.room import box_room, pillar, random_pillar
-from catcher.throws import Throw, sample_stage_throw
+from catcher.throws import Throw, pillar_footprint, sample_stage_throw
 
 
 def test_ik_reaches_target_inside_cone():
@@ -99,5 +99,48 @@ def test_planner_only_aims_at_descending_balls():
 def test_rooms_with_a_board_through_the_robot_can_be_skipped():
     room = box_room()
     assert ready_pose_clear(room)
-    room.panels += pillar((0.6, 0.0), 0.1, room)
+    room.panels += pillar((0.25, 0.0), 0.15, room)  # through both the ready and the tucked pose
     assert not ready_pose_clear(room)
+
+
+def _blocking_room():
+    room = box_room(hi=(4.5, 3.0, 7.0))
+    room.panels += pillar((0.52, 0.0), 0.09, room)
+    return room
+
+
+def test_blocking_pillar_switches_to_the_tucked_pose_and_knows_the_sides():
+    kin = Kinematics(build_model(_blocking_room()))
+    assert kin.pillar is not None and np.array_equal(kin.q_ready, Q_TUCKED)
+    assert not kin.collides(kin.q_ready)
+    assert kin.side(kin.q_ready) == 0
+    assert Kinematics(build_model(box_room())).pillar is None
+
+
+def test_routes_go_around_the_blocking_pillar_and_switching_sides_is_slow():
+    kin = Kinematics(build_model(_blocking_room()))
+    v = np.array([-3.0, 0.0, -5.0])
+    left, ok_l = solve_catch_ik(kin, np.array([0.55, 0.28, 0.6]), v, kin.q_ready, 25)
+    right, ok_r = solve_catch_ik(kin, np.array([0.55, -0.28, 0.6]), v, kin.q_ready, 25)
+    assert ok_l and ok_r and kin.side(left) == 1 and kin.side(right) == -1
+    # Switching sides costs far more than committing: the arm has to unwind around the pillar.
+    switch = CubicTrajectory(left, right).T
+    commit = max(CubicTrajectory(kin.q_ready, left).T, CubicTrajectory(kin.q_ready, right).T)
+    assert switch > 1.8 * commit and switch > 2.1  # longer than any lob past the pillar is in the air
+    for a, b in ((kin.q_ready, left), (kin.q_ready, right), (left, right)):
+        waypoints = kin.route(a, b)
+        assert waypoints is not None and np.array_equal(waypoints[-1], b)
+        legs = zip([a] + waypoints[:-1], waypoints)
+        assert all(kin.leg_clear(p, q) for p, q in legs)
+
+
+def test_throws_pass_beside_the_blocking_pillar_on_both_sides():
+    rng = np.random.default_rng(0)
+    sides = set()
+    for _ in range(10):
+        throw = sample_stage_throw(1, rng, pillar="blocking")
+        center, half = pillar_footprint(throw.room)
+        y = throw.pos[throw.catch_index, 1] - center[1]
+        assert abs(y) > half and throw.bounces_before_catch == 0
+        sides.add(np.sign(y))
+    assert sides == {-1.0, 1.0}

@@ -35,11 +35,14 @@ def main():
     ap.add_argument("--n", type=int, default=40, help="number of throws")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--predictor", choices=["gaussian", "particle"], default="gaussian")
-    ap.add_argument("--pillar", action="store_true", help="add a pillar just in front of the robot")
+    ap.add_argument("--pillar", choices=["front", "blocking"], default=None,
+                    help="front: pillar 0.75-1.4 m out; blocking: straight ahead, the arm must go left or right of it")
     ap.add_argument("--occlusion", action="store_true", help="the belief only sharpens while the ball is visible")
     ap.add_argument("--sigma0", type=float, default=0.005, help="gaussian: belief std at zero horizon (m)")
     ap.add_argument("--growth", type=float, default=0.06, help="gaussian: belief std growth per second of horizon (m/s)")
     ap.add_argument("--bounce-sigma", type=float, default=0.03, help="gaussian: extra belief std per bounce ahead (m)")
+    ap.add_argument("--sigma-v", type=float, default=0.06,
+                    help="particle: velocity error of the state estimate (m/s); larger = less certain")
     ap.add_argument("--t-plan", type=float, default=0.1, help="seconds of ball observed before planning")
     args = ap.parse_args()
 
@@ -49,8 +52,8 @@ def main():
         belief = (f"gaussian belief, std = {args.sigma0} + {args.growth} m/s * horizon"
                   f" + {args.bounce_sigma} m/bounce")
     else:
-        predictor_for = particle_predictor_for(args.seed, args.occlusion)
-        belief = "particle belief"
+        predictor_for = particle_predictor_for(args.seed, args.occlusion, sigma_v=args.sigma_v)
+        belief = f"particle belief (velocity error {args.sigma_v} m/s)"
     planners = {"oracle": None,
                 "plan-once": MeanPlanner(predictor_for, args.t_plan),
                 "mean-only": HedgePlanner(predictor_for, args.t_plan, hedge=False),
@@ -64,7 +67,7 @@ def main():
     hedge_choices = defaultdict(int)
     reselected = {name: 0 for name in planners}
     for _ in range(args.n):
-        throw = sample_stage_throw(args.stage, rng, with_pillar=args.pillar, room_ok=ready_pose_clear)
+        throw = sample_stage_throw(args.stage, rng, pillar=args.pillar, room_ok=ready_pose_clear)
         model = build_model(throw.room)
         for name, planner in planners.items():
             r = run_catch(throw, model=model, planner=planner)
@@ -80,7 +83,7 @@ def main():
                         hedge_choices[c] += 1
                 planner.last = None
 
-    extras = ", ".join(x for x, on in (("pillar", args.pillar), ("occlusion", args.occlusion)) if on)
+    extras = ", ".join(x for x, on in ((f"{args.pillar} pillar", args.pillar), ("occlusion", args.occlusion)) if on)
     print(f"stage {args.stage}{' + ' + extras if extras else ''}, {args.n} throws, {belief}, planning at t = {args.t_plan} s")
     for name in planners:
         per_bounce = ", ".join(f"{b}b: {sum(v)}/{len(v)}" for b, v in sorted(by_bounces[name].items()))

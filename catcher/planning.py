@@ -120,6 +120,10 @@ class HedgePlanner:
     the arm reaches the target (or waits there) until the modes split and the belief
     tells it which one is real, then moves straight to the catch. It picks the best;
     ties go to the most likely mode.
+
+    With a blocking pillar (Kinematics.pillar) the choice is left, right or wait (the
+    tucked ready pose), see _side_target: the pose between the sides is inside the
+    pillar, and switching sides means backing out around it.
     """
 
     predictor_for: Callable[[Throw], Predictor]
@@ -154,8 +158,12 @@ class HedgePlanner:
         Returns (target, solutions, choice); solutions[0] is the most likely catch configuration."""
         if not self.hedge:
             q_mean, ok = solve_catch_ik(kin, belief.plan_mean[k], belief.plan_vel[k], q_guess, cone_deg)
+            if not ok and kin.pillar is not None:  # the mean may have moved to the other side
+                q_mean, ok = solve_catch_ik(kin, belief.plan_mean[k], belief.plan_vel[k], kin.q_ready, cone_deg)
             q_mean = q_mean if ok else q_guess
             return q_mean, q_mean[None], "mean"
+        if kin.pillar is not None:
+            return self._side_target(kin, belief, k, q_guess, cone_deg, rng, q_now, t_r, t_c)
         modes = belief.modes(k, self.n_trajectories, rng)
         if len(modes) == 1:
             solutions, ok = self._mode_solutions(kin, modes[0], q_guess, cone_deg)
@@ -192,6 +200,111 @@ class HedgePlanner:
         return target, likely_first, name
 
     @staticmethod
+    def _route_time(kin, a, b):
+        """Time estimate for moving a -> b, without collision checks: the straight joint-space
+        move, which is what most moves are (Kinematics.route adds waypoints only when it is
+        blocked). Crossing to the other side of a blocking pillar is slow anyway: the catch
+        poses on the two sides differ by ~2 rad in each of joints 1, 3 and 5."""
+        return min_move_time(a, b)
+
+    def _side_target(self, kin, belief, k, q_guess, cone_deg, rng, q_now, t_r, t_c):
+        """Left, right or wait, for a blocking pillar.
+
+        Sampled ball positions at index k (every mode's, weighted by the mode) are split
+        by the side of the pillar they are on; a side's probability is its share of the
+        weight, and samples whose catch IK fails count as misses. Candidates: wait at the
+        ready pose, or each side's catch pose for the weighted mean of its samples (a
+        minimax pose over the samples would jump between re-plans as they are redrawn,
+        and the arm would chase it). The side is forecast to become known when the belief's
+        spread, shrinking linearly to zero at the catch, no longer reaches across the
+        pillar's center line. Each candidate is scored by the probability of reaching the
+        real catch configuration in time: committing reaches its own side directly and the
+        other side only from where the arm is once the side is known; waiting leaves at the
+        next re-plan at the earliest. Ties go to the likelier side.
+        """
+        center, _ = kin.pillar
+        modes = belief.modes(k, self.n_trajectories, rng)
+        points = np.vstack([m.points for m in modes if len(m.points)])
+        weights = np.concatenate([np.full(len(m.points), m.weight / len(m.points)) for m in modes if len(m.points)])
+        vels = np.vstack([np.tile(m.vel, (len(m.points), 1)) for m in modes if len(m.points)])
+        # Only balls inside the catch zone can be caught; the rest (e.g. ones that bounced back
+        # off the pillar) keep their weight as certain misses but don't pull the side targets.
+        catchable = in_catch_zone(points)
+        if not catchable.any():
+            return q_guess, q_guess[None], "none"
+        points, weights, vels = points[catchable], weights[catchable], vels[catchable]
+        sides = np.where(points[:, 1] >= center[1], 1, -1)
+        groups, centers = {}, {}
+        for s, name in ((1, "left"), (-1, "right")):
+            on_side = sides == s
+            if not on_side.any():
+                groups[name] = (np.zeros((0, len(q_guess))), np.zeros(0), 0.0)
+                continue
+            p_c = np.average(points[on_side], axis=0, weights=weights[on_side])
+            v_c = np.average(vels[on_side], axis=0, weights=weights[on_side])
+            q_c, ok = solve_catch_ik(kin, p_c, v_c, q_guess if kin.side(q_guess) == s else kin.q_ready, cone_deg)
+            if not ok:
+                q_c, ok = solve_catch_ik(kin, p_c, v_c, kin.q_ready, cone_deg)
+            seed = q_c if ok else kin.q_ready
+            if ok:
+                centers[name] = q_c
+            sols, ws = [], []
+            for p, v, w in zip(points[on_side], vels[on_side], weights[on_side]):
+                q, ok_p = solve_catch_ik(kin, p, v, seed, cone_deg)
+                if ok_p:
+                    sols.append(q); ws.append(w)
+            groups[name] = (np.array(sols).reshape(-1, len(q_guess)), np.array(ws), weights[on_side].sum())
+        if not any(len(g[0]) for g in groups.values()):
+            return q_guess, q_guess[None], "none"
+
+        # When will the side be known?
+        mean_y = np.average(points[:, 1], weights=weights)
+        spread = np.sqrt(np.average((points[:, 1] - mean_y) ** 2, weights=weights))
+        d = abs(mean_y - center[1])
+        t_k = float(belief.times[k])
+        t_known = t_r if spread < 1e-6 else t_k - (t_k - t_r) * min(1.0, d / (1.64 * spread))
+        deadline = t_c - self.arrive_lead
+
+        T = lambda a, b: self._route_time(kin, a, b)
+
+        def arm_at(q_target, t):
+            """Where the arm is at time t heading from q_now to q_target (joint-space line)."""
+            f = 1.0 if t <= t_r else min(1.0, (t - t_r) / max(T(q_now, q_target), 1e-6))
+            return q_now + f * (q_target - q_now)
+
+        def p_commit(side_name, q_side):
+            """Head for one side now. Its catch poses are reached directly (corrections within a
+            side are cheap); the other side's only from where the arm is once the side is known."""
+            score = 0.0
+            for name, (sols, ws, _) in groups.items():
+                if not len(sols):
+                    continue
+                if name == side_name:
+                    ok = [t_r + T(q_now, qi) <= deadline for qi in sols]
+                else:
+                    q_then = arm_at(q_side, t_known)
+                    ok = [max(t_known, t_r) + T(q_then, qi) <= deadline for qi in sols]
+                score += float(np.sum(ws * np.array(ok)))
+            return score
+
+        def p_wait():
+            """Stay put: leave no earlier than the next re-plan (a waiting planner always loses
+            at least that cycle, or it would wait forever), or when the side is known."""
+            t_go = max(t_known, t_r + self.replan_dt)
+            q_then = arm_at(kin.q_ready, t_go)
+            return sum(float(np.sum(ws * np.array([t_go + T(q_then, qi) <= deadline for qi in sols])))
+                       for sols, ws, _ in groups.values() if len(sols))
+
+        candidates = [(name, centers[name]) for name, g in sorted(groups.items(), key=lambda g: -g[1][2])
+                      if name in centers]  # likelier side first
+        scored = [(p_commit(name, q), -i, name, q) for i, (name, q) in enumerate(candidates)]
+        scored.append((p_wait(), -len(candidates), "wait", kin.q_ready))
+        _, _, name, target = max(scored, key=lambda c: c[:2])
+        likely = candidates[0][1] if candidates else kin.q_ready  # no side reachable: wait
+        chosen = target if name != "wait" else likely
+        return target, np.vstack([chosen, likely]), name
+
+    @staticmethod
     def _segment(kin, q_now, v_now, target, time_left):
         """Cubic from the current reference state to target, or None if its path hits the room."""
         segment = HermiteTrajectory(q_now.copy(), v_now.copy(), target, max(time_left, min_move_time(q_now, target)))
@@ -199,8 +312,15 @@ class HedgePlanner:
 
     def __call__(self, kin: Kinematics, throw: Throw, cone_deg: float):
         predictor = self.predictor_for(throw)
-        belief = predictor(self.t_plan)
-        k, to_mean = plan_ik_catch(kin, throw, cone_deg, belief=belief, t_start=self.t_plan)
+        t_start = self.t_plan
+        belief = predictor(t_start)
+        k, to_mean = plan_ik_catch(kin, throw, cone_deg, belief=belief, t_start=t_start)
+        # With a blocking pillar, an early belief can put every likely outcome out of reach
+        # (e.g. most predicted balls hit the pillar): wait in the ready pose and try again.
+        while kin.pillar is not None and np.array_equal(to_mean.q1, to_mean.q0) and t_start < throw.times[k] - 0.3:
+            t_start += self.replan_dt
+            belief = predictor(t_start)
+            k, to_mean = plan_ik_catch(kin, throw, cone_deg, belief=belief, t_start=t_start)
         if np.array_equal(to_mean.q1, to_mean.q0):  # nothing reachable: hold
             return k, SegmentedReference([(self.t_plan, to_mean)])
         rng = np.random.default_rng(self.seed)
@@ -209,8 +329,8 @@ class HedgePlanner:
 
         q_guess = to_mean.q1
         segments: list[tuple[float, HermiteTrajectory]] = []
-        q_now, v_now = Q_READY.copy(), np.zeros_like(Q_READY)
-        t_r, i = self.t_plan, 0
+        q_now, v_now = kin.q_ready.copy(), np.zeros_like(kin.q_ready)
+        t_r, i = t_start, 0
         while i == 0 or t_r <= t_c - self.final_lead + 1e-9:
             if segments:  # the reference's state at t_r, where the new segment starts
                 t0, traj = segments[-1]
@@ -236,10 +356,14 @@ class HedgePlanner:
             segment = self._segment(kin, q_now, v_now, target, t_c - self.arrive_lead - t_seg)
             if segment is None:
                 segment = self._segment(kin, q_now, v_now, solutions[0], t_c - self.arrive_lead - t_seg)
+            if segment is None and kin.pillar is not None:  # blocked: head for the route's next waypoint
+                waypoints = kin.route(q_now, target) or kin.route(q_now, solutions[0])
+                if waypoints is not None and len(waypoints) > 1:
+                    segment = self._segment(kin, q_now, v_now, waypoints[0], 0.0)
             if segment is None:
                 if segments:  # keep following the previous, collision-free segment
                     continue
-                return k, SegmentedReference([(self.t_plan, CubicTrajectory(Q_READY, Q_READY))])
+                return k, SegmentedReference([(self.t_plan, CubicTrajectory(kin.q_ready, kin.q_ready))])
             segments.append((t_seg, segment))
         return k, SegmentedReference(segments)
 

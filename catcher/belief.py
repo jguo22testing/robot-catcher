@@ -24,7 +24,7 @@ from dataclasses import dataclass, replace
 import numpy as np
 
 from .ball_sim import simulate
-from .room import Room
+from .room import Room, blocking_pillar_footprint
 from .throws import Throw, in_catch_zone
 from .visibility import last_seen_time
 
@@ -143,7 +143,10 @@ class ParticleBelief:
     """A cloud of possible ball trajectories, as seen at `t_now`.
 
     Times up to t_now are observed (every particle is at the true position). After
-    that, each particle carries its own bounce history, which `modes` groups by.
+    that, each particle carries its own bounce history, which `modes` groups by. With a
+    blocking pillar (`pillar_y`, its center line) particles are also grouped by the side
+    of it they are on: passing left and passing right bounce off the same panels (none),
+    and their average would be inside the pillar.
     """
 
     times: np.ndarray  # (T,)
@@ -152,20 +155,31 @@ class ParticleBelief:
     bounces: list[list[tuple[float, int]]]  # per particle: (time, panel index) of each future bounce
     t_now: float
     min_weight: float = 0.05  # modes holding fewer particles than this fraction are dropped
+    pillar_y: float | None = None  # center line of a blocking pillar, if any
+
+    def _side(self, i: int, k: int) -> int:
+        if self.pillar_y is None:
+            return 0
+        return 1 if self.particles[i, k, 1] >= self.pillar_y else -1
 
     def __post_init__(self):
         self.mean = self.particles.mean(0)
         self.vel = self.particle_vel.mean(0)
         self.std = self.particles.std(0)
-        # Most likely path: particles grouped by the panels they bounce off before first
-        # entering the catch zone; plan on the largest group's mean.
+        # Most likely path: particles that reach the catch zone, grouped by the panels they
+        # bounce off before entering it (and the side of a blocking pillar they enter on);
+        # plan on the largest group's mean. Balls that never reach the zone can't be caught.
         zone = in_catch_zone(self.particles) & (self.times > self.t_now)
-        groups = defaultdict(list)
+        groups, missing = defaultdict(list), []
         for i in range(len(self.particles)):
             entry = np.flatnonzero(zone[i])
-            t_entry = self.times[entry[0]] if len(entry) else np.inf
-            groups[tuple(panel for t, panel in self.bounces[i] if t <= t_entry)].append(i)
-        likely = max(groups.values(), key=len)
+            if not len(entry):
+                missing.append(i)
+                continue
+            t_entry = self.times[entry[0]]
+            panels = tuple(panel for t, panel in self.bounces[i] if t <= t_entry)
+            groups[(panels, self._side(i, entry[0]))].append(i)
+        likely = max(groups.values(), key=len) if groups else missing
         self.plan_mean = self.particles[likely].mean(0)
         self.plan_vel = self.particle_vel[likely].mean(0)
 
@@ -179,9 +193,10 @@ class ParticleBelief:
         points = self.sample(n, rng)[:, k]
         return points[self.mahalanobis_sq(k, points) <= chi2]
 
-    def signature(self, i: int, k: int) -> tuple[int, ...]:
-        """Panels particle i bounces off between t_now and times[k], in order."""
-        return tuple(panel for t, panel in self.bounces[i] if t <= self.times[k])
+    def signature(self, i: int, k: int) -> tuple[tuple[int, ...], int]:
+        """Panels particle i bounces off between t_now and times[k], in order, and the side
+        of a blocking pillar it is on at k (0 without one)."""
+        return tuple(panel for t, panel in self.bounces[i] if t <= self.times[k]), self._side(i, k)
 
     def modes(self, k: int, n: int | None = None, rng: np.random.Generator | None = None) -> list[Mode]:
         """Particles grouped by the panels they bounce off before times[k], most likely first.
@@ -205,7 +220,10 @@ class ParticleBelief:
 
     def _split_time(self, sig_a, idx_a, sig_b, idx_b) -> float:
         """When two modes part: the (median) time of the first bounce where their panel
-        sequences differ, or of the extra bounce one of them has."""
+        sequences differ, or of the extra bounce one of them has. Modes that differ only in
+        the side of a blocking pillar have no such bounce (inf); the planner handles those
+        with its own side forecast."""
+        (sig_a, _), (sig_b, _) = sig_a, sig_b
         c = 0
         while c < min(len(sig_a), len(sig_b)) and sig_a[c] == sig_b[c]:
             c += 1
@@ -236,6 +254,8 @@ class ParticlePredictor:
         self.rooms = [self._perturbed(throw.room, rng, material_sigma) for _ in range(n)]
         self.bounce_times = np.array([b.t for b in throw.traj.bounces])
         self.seen = np.ones(len(throw.times), dtype=bool) if seen is None else seen
+        footprint = blocking_pillar_footprint(throw.room)
+        self.pillar_y = None if footprint is None else float(footprint[0][1])
         self._cache: dict[float, ParticleBelief] = {}
 
     @staticmethod
@@ -269,4 +289,4 @@ class ParticlePredictor:
             traj = simulate(room, x[:3], x[3:], t_end=float(times[-1] - t_obs) + 1e-6)
             pos[i, future], vel[i, future] = traj.sample(times[future] - t_obs)
             bounces.append([(b.t + t_obs, b.panel_index) for b in traj.bounces])
-        return ParticleBelief(times, pos, vel, bounces, t_obs)
+        return ParticleBelief(times, pos, vel, bounces, t_obs, pillar_y=self.pillar_y)

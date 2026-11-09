@@ -20,7 +20,7 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
-from .room import Room
+from .room import BLOCKING_PILLAR_MAX_X, Room
 from .throws import Throw, in_catch_zone
 
 IIWA_XML = Path(__file__).resolve().parent.parent / "models" / "kuka_iiwa_14" / "iiwa14.xml"
@@ -40,6 +40,10 @@ TORQUE_LIMITS = np.array([320, 320, 176, 176, 110, 40, 40], dtype=float)
 # "Ready" posture: cup centered in the catch zone, opening tilted up toward the
 # thrower (+x). Incoming balls mostly descend, so this minimizes reorientation.
 Q_READY = np.array([0.0, 0.3, 0.0, -1.7, 0.0, -1.2, 0.0])
+# Ready posture when Q_READY would hit the room (a blocking pillar): the arm pulled back and
+# up, cup at about (0.05, 0, 1.0), centered so it can swing around either side. Chosen to
+# minimize the time to catch points beside the pillar (swing the base, then reach).
+Q_TUCKED = np.array([0.0, -0.984, 0.0, -1.771, 0.0, -0.031, 0.0])
 
 _NOCONTACT = dict(contype=0, conaffinity=0)
 # Collision bits: geoms a and b touch if (a.contype & b.conaffinity) or (b.contype & a.conaffinity).
@@ -116,9 +120,10 @@ ARM_BODIES = [f"link{i}" for i in range(1, 8)]
 
 
 def ready_pose_clear(room: Room) -> bool:
-    """Whether the arm in its ready pose is clear of the room. Random boards are placed
-    without regard to the robot and sometimes pass through it."""
-    return not Kinematics(build_model(room)).collides(Q_READY)
+    """Whether the arm in its ready pose (Kinematics.q_ready) is clear of the room. Random
+    boards are placed without regard to the robot and sometimes pass through it."""
+    kin = Kinematics(build_model(room))
+    return not kin.collides(kin.q_ready)
 
 
 def set_ball(data: mujoco.MjData, pos: np.ndarray, vel: np.ndarray | None = None):
@@ -153,6 +158,28 @@ class Kinematics:
         arm_ids = [model.body(name).id for name in ARM_BODIES]
         self.arm_geoms = np.isin(model.geom_bodyid, arm_ids) & (model.geom_contype > 0)
         self.ball_geom = model.geom("ball").id
+        # A pillar inside the arm's reach, as (center xy, half-width), else None.
+        faces = [g for g in range(model.ngeom) if (model.geom(g).name or "").startswith("pillar")]
+        self.pillar = None
+        if faces:
+            center = model.geom_pos[faces, :2].mean(0)
+            if center[0] < BLOCKING_PILLAR_MAX_X:
+                self.pillar = (center, float(model.geom_size[faces[0], 0]))
+        self.q_ready = Q_READY if not self.collides(Q_READY) else Q_TUCKED
+
+    def side(self, q: np.ndarray) -> int:
+        """Which side of a blocking pillar the arm reaches around at q: +1 left (+y), -1
+        right, from where the cup is. 0 if there is no blocking pillar, or the cup is still
+        pulled back (more than 15 cm in front of the pillar's near face) or within 5 cm of
+        its center line. (The base yaw is no guide: IK can reach the left side with the base
+        turned right and the arm wrapped around.)"""
+        if self.pillar is None:
+            return 0
+        (cx, cy), half = self.pillar
+        cup, _, _ = self(q)
+        if cup[0] < cx - half - 0.15 or abs(cup[1] - cy) < 0.05:
+            return 0
+        return 1 if cup[1] > cy else -1
 
     def __call__(self, q: np.ndarray):
         """Returns cup center position, cup axis (opening direction), and the 6x7 Jacobian."""
@@ -179,6 +206,25 @@ class Kinematics:
         """Whether a joint trajectory (called with time from its start) collides at any of
         n evenly spaced times over [0, duration]."""
         return any(self.collides(traj(t)[0]) for t in np.linspace(0.0, duration, n))
+
+    def leg_clear(self, a: np.ndarray, b: np.ndarray) -> bool:
+        traj = CubicTrajectory(a, b)
+        return not self.path_collides(traj, traj.T, 16)
+
+    def route(self, a: np.ndarray, b: np.ndarray) -> list[np.ndarray] | None:
+        """Collision-free waypoints from a to b (b last), or None: straight in joint space;
+        else swing the base to b's yaw first, then reach; else back to the ready pose,
+        swing, and reach (the way around to the other side of a blocking pillar)."""
+        if self.leg_clear(a, b):
+            return [b]
+        for start in (a, self.q_ready):
+            swing = start.copy()
+            swing[0] = b[0]
+            legs = ([] if start is a else [start]) + [swing, b]
+            points = [a] + legs
+            if all(self.leg_clear(p, q) for p, q in zip(points[:-1], points[1:])):
+                return legs
+        return None
 
 
 def _cone_error(axis: np.ndarray, target_axis: np.ndarray, cone_rad: float):
@@ -261,6 +307,22 @@ class CubicTrajectory:
                 dq * (6 - 12 * s) / self.T**2 * moving)
 
 
+class RouteTrajectory:
+    """Rest-to-rest cubics through a list of waypoints."""
+
+    def __init__(self, q0: np.ndarray, waypoints: list[np.ndarray]):
+        self.q0, self.q1 = q0, waypoints[-1]
+        self.legs = [CubicTrajectory(a, b) for a, b in zip([q0] + waypoints[:-1], waypoints)]
+        self.T = sum(leg.T for leg in self.legs)
+
+    def __call__(self, t: float):
+        for leg in self.legs[:-1]:
+            if t < leg.T:
+                return leg(t)
+            t -= leg.T
+        return self.legs[-1](t)
+
+
 class DiffIKReference:
     """Differential IK toward a fixed catch target, re-solved every `dt`.
 
@@ -274,7 +336,7 @@ class DiffIKReference:
         self.kin, self.p, self.a, self.dt = kin, p_target, axis_target, dt
         self.gain, self.max_speed = gain, max_speed
         self.lo, self.hi = kin.lo, kin.hi
-        self.q, self.v, self.t_next = Q_READY.copy(), np.zeros(len(Q_READY)), 0.0
+        self.q, self.v, self.t_next = kin.q_ready.copy(), np.zeros(len(Q_READY)), 0.0
 
     def __call__(self, t: float):
         while t >= self.t_next:
@@ -284,7 +346,7 @@ class DiffIKReference:
             if speed > self.max_speed:
                 V *= self.max_speed / speed
             w, _ = _cone_error(axis, self.a, 0.0)
-            v = _task_step(J, np.concatenate([V, self.gain * w]), axis, self.q, Q_READY)
+            v = _task_step(J, np.concatenate([V, self.gain * w]), axis, self.q, self.kin.q_ready)
             v *= min(1.0, 1.0 / np.max(np.abs(v) / VELOCITY_LIMITS))
             self.q = np.clip(self.q + v * self.dt, self.lo, self.hi)
             self.v = v
@@ -294,18 +356,20 @@ class DiffIKReference:
 
 def plan_ik_catch(kin: Kinematics, throw: Throw, cone_half_angle_deg: float,
                   stride: int = 2, max_candidates: int = 40, belief=None,
-                  q_start: np.ndarray = Q_READY, t_start: float = 0.0, min_descent: float = MIN_DESCENT):
+                  q_start: np.ndarray | None = None, t_start: float = 0.0, min_descent: float = MIN_DESCENT):
     """Catch plan: the earliest in-workspace ball sample the arm can reach in time
-    (or the least-late one if none), skipping targets whose joint path hits the room.
+    (or the least-late one if none), skipping targets with no collision-free route
+    (Kinematics.route: straight, or swing the base first, or around through the ready pose).
     Only points where the ball is coming down (v_z / |v| < -min_descent) count: the cup
     faces the incoming ball, so a rising ball would need an upside-down cup, and the ball
     falls back out of it. Returns (index, joint trajectory).
 
     By default it plans on the ground truth (the oracle). With a `belief` (see
     catcher.belief) it aims at the belief's planning path (`plan_mean`) instead.
-    The motion starts from rest at q_start at time t_start; the returned trajectory
-    runs on time relative to t_start.
+    The motion starts from rest at q_start (default: the ready pose) at time t_start; the
+    returned trajectory runs on time relative to t_start.
     """
+    q_start = kin.q_ready if q_start is None else q_start
     pos, vel = (throw.pos, throw.vel) if belief is None else (belief.plan_mean, belief.plan_vel)
     best = None
     descending = vel[:, 2] < -min_descent * np.linalg.norm(vel, axis=1)
@@ -316,9 +380,10 @@ def plan_ik_catch(kin: Kinematics, throw: Throw, cone_half_angle_deg: float,
             q, ok = solve_catch_ik(kin, pos[k], vel[k], q_start, cone_half_angle_deg, restarts)
             if not ok:
                 continue
-            traj = CubicTrajectory(q_start, q)
-            if kin.path_collides(traj, traj.T):
+            waypoints = kin.route(q_start, q)
+            if waypoints is None:
                 continue
+            traj = CubicTrajectory(q_start, q) if len(waypoints) == 1 else RouteTrajectory(q_start, waypoints)
             slack = throw.times[k] - t_start - traj.T
             if best is None or slack > best[0]:
                 best = (slack, int(k), traj)
@@ -386,7 +451,7 @@ def run_catch(throw: Throw, model: mujoco.MjModel | None = None, sim_time: float
     sim_time = sim_time if sim_time is not None else min(t_c + 0.5, float(throw.times[-1]))
 
     data = mujoco.MjData(model)
-    data.qpos[:N_ARM] = Q_READY
+    data.qpos[:N_ARM] = kin.q_ready
     dt = model.opt.timestep
     step_times = np.arange(0.0, sim_time + dt, dt)
     replay_pos, replay_vel = throw.traj.sample(step_times)

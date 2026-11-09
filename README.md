@@ -139,6 +139,33 @@ Results (60 throws, balls caught and kept in the cup):
   the room exactly and is sharper after the bounce, which is why every planner does better with it.
 - The arm never touches the room in any of these runs.
 
+### Blocking pillar: going left or right
+
+`--pillar blocking` puts a thin pillar straight ahead of the robot, inside its reach (center
+0.48–0.55 m out, half-width 7–11 cm), and throws lobs past one side of it, 11–25 cm from its
+face (`sample_throw_beside_pillar`). The room gets a 7 m ceiling so the lobs can last
+1.6–2.1 s. The arm waits tucked behind the pillar (`Q_TUCKED`) and has to reach around it:
+about 2 s to either side, and about 3.9 s to switch sides (joints 1, 3 and 5 each turn ~2 rad).
+So it has to commit to a side early, and a wrong guess can't be undone. Paths are IK goals plus
+straight joint-space moves, with waypoints when those are blocked (`Kinematics.route`: swing
+the base first, or go back through the tucked pose). With a blocking pillar the
+uncertainty-aware planner chooses left, right or wait each re-plan (`_side_target`).
+
+Results (stage 1 rooms + blocking pillar, particle belief, 40 throws):
+
+| Velocity error of the estimate | oracle | plan-once | mean-only | uncertainty-aware |
+|---|---|---|---|---|
+| 0.06 m/s | 37 | 5 | 26 | 24 |
+| 0.15 m/s | 37 | 5 | 23 | 18 |
+| 0.3 m/s | 37 | 0 | 9 | 5 |
+
+The commitment is forced immediately: reaching a side takes about as long as the lob is in the
+air, so there is no slack to wait for information. Committing to the more likely side at once
+is then the best policy, and that is what mean-only does. The uncertainty-aware planner's only
+extra option is to wait, which here can only cost time; its forecast of when the side becomes
+known is also optimistic, so it still waits in 9–17% of re-plans. It could pay off where there
+is slack, e.g. with faster time-scaling of the moves (they are rest-to-rest cubics today).
+
 `docs/pillar_catch.html` (open it in a browser) shows a mean-only catch of a ball bouncing
 off the pillar, with these results.
 
