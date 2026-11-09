@@ -25,7 +25,7 @@ uv run pytest      # sanity tests for the ball sim and throw generator
 | `models/kuka_iiwa_14/` | iiwa14 model vendored from [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) (Apache-2.0). |
 | `scripts/simulate_ball.py` | Plot a few throws (3D + side view, bounces, catch points). |
 | `scripts/generate_dataset.py` | Write a stage dataset to `data/*.npz`. |
-| `scripts/run_catch.py` | Simulate one catch and save a GIF, replay it in the MuJoCo viewer (`--viewer`), or `--eval N` for a headless catch rate. |
+| `scripts/run_catch.py` | Simulate one catch and save a GIF, replay it in the MuJoCo viewer (`--viewer`), or `--eval N` for a headless catch rate. `--planner` (`mean`, `mean-replan` or `hedge`) plans on a synthetic belief instead of the ground truth. |
 
 ## Bounce Lab (web UI)
 
@@ -83,6 +83,46 @@ Training logs to Weights & Biases (project `robot-catcher`) if you've run `uv ru
 and otherwise saves the log locally for a later `wandb sync`. Pass `--wandb disabled` to turn it off.
 Results go to `outputs/trajectory/<name>/`: `model.pt` when finished, `latest.pt` at every evaluation,
 and `metrics.json` with the per-horizon numbers.
+
+## Uncertainty-aware planning
+
+The planners in `catcher/planning.py` act on a Gaussian belief over the ball's future
+positions (`catcher/belief.py`) instead of the ground truth. The trajectory model isn't
+wired in yet, so `SyntheticPredictor` stands in for it: it returns a per-axis mean and
+std whose std grows with the prediction horizon and with each bounce ahead, and the
+mean carries a matching random error, so the belief is calibrated. `GaussianBelief.sample`
+draws whole trajectories from it (exact Gaussian marginals at every time, smooth in time).
+
+| Planner | What it does |
+|---|---|
+| `MeanPlanner` | Observes for `t_plan`, then commits once to the earliest reachable belief mean. |
+| `HedgePlanner` | Fixes the catch time at `t_plan`, then re-plans every 50 ms on the sharper belief until 0.1 s before the catch. Each re-plan samples trajectories from the belief, keeps those inside the 90% ellipsoid at the catch time, solves the catch IK for each, and steers toward the joint configuration that minimizes the worst-case joint-space time to any of them (the per-joint midrange). Each segment is a cubic that starts from the reference's current position and velocity, so the arm never stops between re-plans. `hedge=False` steers toward the mean's configuration instead (an ablation). |
+
+```bash
+uv run python scripts/compare_planners.py --stage 2 --n 60    # oracle vs mean vs mean-replan vs hedge
+uv run python scripts/run_catch.py --stage 2 --seed 3 --planner hedge   # GIF of one belief-based catch
+```
+
+Catch rates with the default synthetic belief (std 5 mm + 6 cm/s of horizon + 3 cm per bounce ahead,
+planning at t = 0.1 s):
+
+| Planner | Stage 1 (40) | Stage 2 (60) | Stage 3 (40) |
+|---|---|---|---|
+| oracle (ground truth) | 39 | 48 | 32 |
+| mean (plans once) | 8 | 5 | 1 |
+| mean-replan | 37 | 30 | 16 |
+| hedge | 37 | 29 | 18 |
+
+Re-planning is what matters: planning once leaves 5-15 cm of belief std at the catch, more than
+the 5.25 cm the cup allows. Hedging on top of re-planning is a wash so far (+2 on stage 3, -1 on
+stage 2). The remaining misses are timing, not tracking: the controller follows the reference to
+within a few mm, but the catch time is the earliest one the mean can reach, so a late correction
+can't finish in time. Choosing a later catch time that covers the whole 90% ellipsoid was tried
+and did worse (18/60 on stage 2): before the bounce the ellipsoid is wide, so it pushed catches
+late into the throw.
+
+Catches are always scored against the true ball. `run_catch(planner=...)` takes any
+`(kin, throw, cone_deg) -> (catch index, joint reference)` callable.
 
 ## Conventions
 

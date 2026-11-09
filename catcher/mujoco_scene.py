@@ -215,27 +215,36 @@ class DiffIKReference:
 
 
 def plan_ik_catch(kin: Kinematics, throw: Throw, cone_half_angle_deg: float,
-                  stride: int = 2, max_candidates: int = 40):
-    """Oracle catch plan: the earliest in-workspace ball sample the arm can reach
-    in time (or the least-late one if none). Returns (index, joint trajectory)."""
+                  stride: int = 2, max_candidates: int = 40, belief=None,
+                  q_start: np.ndarray = Q_READY, t_start: float = 0.0):
+    """Catch plan: the earliest in-workspace ball sample the arm can reach in time
+    (or the least-late one if none). Returns (index, joint trajectory).
+
+    By default it plans on the ground truth (the oracle). With a `belief` (a
+    GaussianBelief over the throw's time grid) it aims at the belief mean instead.
+    The motion starts from rest at q_start at time t_start; the returned trajectory
+    runs on time relative to t_start.
+    """
+    pos, vel = (throw.pos, throw.vel) if belief is None else (belief.mean, belief.vel)
     best = None
-    candidates = np.flatnonzero(in_catch_zone(throw.pos))[::stride][:max_candidates]
-    # Cheap pass from the ready pose first; random restarts only if nothing was reachable.
+    candidates = np.flatnonzero(in_catch_zone(pos) & (throw.times > t_start))[::stride][:max_candidates]
+    # Cheap pass from the start pose first; random restarts only if nothing was reachable.
     for restarts in (0, 8):
         for k in candidates[::1 if restarts == 0 else 3]:
-            q, ok = solve_catch_ik(kin, throw.pos[k], throw.vel[k], Q_READY, cone_half_angle_deg, restarts)
+            q, ok = solve_catch_ik(kin, pos[k], vel[k], q_start, cone_half_angle_deg, restarts)
             if not ok:
                 continue
-            traj = CubicTrajectory(Q_READY, q)
-            slack = throw.times[k] - traj.T
+            traj = CubicTrajectory(q_start, q)
+            slack = throw.times[k] - t_start - traj.T
             if best is None or slack > best[0]:
                 best = (slack, int(k), traj)
             if slack >= 0.05:
                 break
         if best is not None:
             break
-    if best is None:  # nothing reachable: hold the ready pose (counts as a miss)
-        return oracle_catch_index(throw), CubicTrajectory(Q_READY, Q_READY)
+    if best is None:  # nothing reachable: hold the start pose (counts as a miss)
+        k = oracle_catch_index(throw) if belief is None else int(candidates[0]) if len(candidates) else throw.catch_index
+        return k, CubicTrajectory(q_start, q_start)
     return best[1], best[2]
 
 
@@ -260,18 +269,24 @@ class CatchResult:
 
 def run_catch(throw: Throw, model: mujoco.MjModel | None = None, sim_time: float | None = None,
               controller: str = "ik", ik_dt: float = 5e-3, log_dt: float = 1 / 60,
-              cone_half_angle_deg: float = 30.0, kp: float = 400.0) -> CatchResult:
-    """Simulate the arm moving to the oracle (ground-truth) catch target and score the catch.
+              cone_half_angle_deg: float = 30.0, kp: float = 400.0, planner=None) -> CatchResult:
+    """Simulate the arm moving to a catch target and score the catch against the true ball.
 
     controller="ik":     IK (with the cone constraint) once, then a joint-space cubic.
     controller="diffik": differential IK toward a fixed catch pose, every ik_dt.
-    Both are tracked by a computed-torque controller on the simulated iiwa.
+    Both plan on the oracle (ground-truth) ball and are tracked by a computed-torque
+    controller on the simulated iiwa.
+
+    planner overrides the controller choice: a callable (kin, throw, cone_deg) ->
+    (catch index, joint reference), e.g. the belief-based ones in catcher.planning.
     """
     model = model or build_model(throw.room)
     kin = Kinematics(model)
     # Aim slightly inside the success cone to leave room for tracking error.
     ik_cone_deg = cone_half_angle_deg - 5.0
-    if controller == "ik":
+    if planner is not None:
+        k, reference = planner(kin, throw, ik_cone_deg)
+    elif controller == "ik":
         k, reference = plan_ik_catch(kin, throw, ik_cone_deg)
     elif controller == "diffik":
         k = oracle_catch_index(throw)
@@ -279,7 +294,7 @@ def run_catch(throw: Throw, model: mujoco.MjModel | None = None, sim_time: float
         raise ValueError(f"unknown controller {controller!r}")
     t_c = float(throw.times[k])
     p_ball, v_ball = throw.pos[k], throw.vel[k]
-    if controller == "diffik":
+    if planner is None and controller == "diffik":
         reference = DiffIKReference(kin, p_ball, -v_ball / np.linalg.norm(v_ball), ik_dt)
     sim_time = sim_time if sim_time is not None else min(t_c + 0.5, float(throw.times[-1]))
 
