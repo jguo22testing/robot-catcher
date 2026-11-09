@@ -133,7 +133,7 @@ class HedgePlanner:
             if ok:
                 solutions.append(q)
         solutions = np.array(solutions)
-        lo, hi = kin.model.jnt_range.T
+        lo, hi = kin.lo, kin.hi
         return np.clip((solutions.min(0) + solutions.max(0)) / 2, lo, hi), solutions
 
     def __call__(self, kin: Kinematics, throw: Throw, cone_deg: float):

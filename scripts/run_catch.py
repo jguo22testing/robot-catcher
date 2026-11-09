@@ -19,7 +19,8 @@ from pathlib import Path
 
 import numpy as np
 
-from catcher.mujoco_scene import add_path_to_scene, build_model, default_camera, render_frames, run_catch
+from catcher.mujoco_scene import (N_ARM, add_path_to_scene, build_model, default_camera, render_frames, run_catch,
+                                  set_ball)
 from catcher.planning import HedgePlanner, MeanPlanner, synthetic_predictor_for
 from catcher.throws import sample_stage_throw
 
@@ -51,7 +52,8 @@ def replay_in_viewer(model, result, path_points):
             for t, q, p in zip(result.times, result.q, result.ball):
                 if not viewer.is_running():
                     break
-                data.qpos[:], data.mocap_pos[0] = q, p
+                data.qpos[:N_ARM] = q
+                set_ball(data, p)
                 mujoco.mj_forward(model, data)
                 viewer.user_scn.ngeom = 0
                 add_path_to_scene(viewer.user_scn, path_points[::3])

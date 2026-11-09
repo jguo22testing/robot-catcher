@@ -1,9 +1,15 @@
 """MuJoCo scene: KUKA iiwa14 with a cup end-effector inside a room of panels.
 
-The ball is NOT simulated by MuJoCo here; its trajectory comes from the NumPy
-simulator (catcher.ball_sim) and is replayed through a mocap body. MuJoCo
-simulates the arm: a joint reference (IK + cubic, or differential IK) tracked by
-a computed-torque controller.
+MuJoCo simulates the arm: a joint reference (IK + cubic, or differential IK)
+tracked by a computed-torque controller. The ball is a free MuJoCo body. Its flight
+through the room comes from the NumPy simulator (catcher.ball_sim), which is the
+ground truth the predictors work from: run_catch replays it until the ball comes
+near the arm, then hands it to MuJoCo, so contacts with the cup, the arm and the
+room near the robot are simulated. A catch counts if the ball is still in the cup
+at the end of the run.
+
+Contacts: arm-room, ball-room and ball-arm (including the cup). The arm never
+collides with itself.
 """
 
 from __future__ import annotations
@@ -21,7 +27,9 @@ IIWA_XML = Path(__file__).resolve().parent.parent / "models" / "kuka_iiwa_14" / 
 CUP_RADIUS = 0.07
 CUP_DEPTH = 0.08
 FLANGE_Z = 0.045  # link 7 flange (Menagerie "attachment_site")
-BALL_RADIUS = 0.035  # visual only; the simulator treats the ball as a point
+BALL_RADIUS = 0.035  # MuJoCo ball radius; the NumPy simulator treats the ball as a point
+BALL_MASS = 0.057  # tennis ball
+RELEASE_DIST = 0.35  # hand the ball to MuJoCo once it is this close to any arm link origin
 PANEL_THICKNESS = 0.02
 
 # KUKA LBR iiwa 14 R820 spec-sheet limits (the Menagerie model doesn't include them).
@@ -33,21 +41,36 @@ TORQUE_LIMITS = np.array([320, 320, 176, 176, 110, 40, 40], dtype=float)
 Q_READY = np.array([0.0, 0.3, 0.0, -1.7, 0.0, -1.2, 0.0])
 
 _NOCONTACT = dict(contype=0, conaffinity=0)
+# Collision bits: geoms a and b touch if (a.contype & b.conaffinity) or (b.contype & a.conaffinity).
+_ROOM, _ARM, _BALL = 1, 2, 4
+_ARM_CONTACT = dict(contype=_ARM, conaffinity=0)  # arm touches room and ball, never itself
+_ROOM_CONTACT = dict(contype=_ROOM, conaffinity=_ARM | _BALL)
+_BALL_CONTACT = dict(contype=_BALL, conaffinity=_ROOM | _ARM)
+N_ARM = 7  # arm joints come first in qpos/qvel; the ball's free joint follows
+# Stiff, overdamped contact for the ball and cup, i.e. a padded cup. MuJoCo's default
+# (timeconst 0.02 s) is so soft that a 7 m/s ball sinks through the cup bottom; 0.002 s
+# is the stiffest it allows at the 1 ms time step. With damping ratio 1 the ball still
+# rebounds about 1 m/s off the (compliant) arm and climbs out; 2 stops that.
+_STIFF = dict(solref=[0.002, 2.0])
+CUP_WALL = 0.01  # cup bottom and wall thickness
 
 
 def _add_cup(body: mujoco.MjsBody, n_walls: int = 12):
-    """Open cup made of a bottom disc and a ring of thin box walls. Opening along link 7's +z."""
+    """Open cup made of a bottom disc and a ring of box walls, both CUP_WALL thick, with
+    inner radius CUP_RADIUS and inner depth CUP_DEPTH. Opening along link 7's +z."""
     green = [0.1, 0.6, 0.3, 1.0]
-    z0 = FLANGE_Z + 0.005
+    z0 = FLANGE_Z + 0.005  # inner bottom surface
     body.add_geom(name="cup_bottom", type=mujoco.mjtGeom.mjGEOM_CYLINDER,
-                  size=[CUP_RADIUS, 0.002, 0], pos=[0, 0, z0], rgba=green, mass=0.05, **_NOCONTACT)
-    wall_w = 2 * CUP_RADIUS * np.tan(np.pi / n_walls) + 0.004
+                  size=[CUP_RADIUS + CUP_WALL, CUP_WALL / 2, 0], pos=[0, 0, z0 - CUP_WALL / 2], rgba=green,
+                  mass=0.05, **_ARM_CONTACT, **_STIFF)
+    r_wall = CUP_RADIUS + CUP_WALL / 2
+    wall_w = 2 * (CUP_RADIUS + CUP_WALL) * np.tan(np.pi / n_walls) + 0.004
     for i in range(n_walls):
         a = 2 * np.pi * i / n_walls
-        body.add_geom(type=mujoco.mjtGeom.mjGEOM_BOX, size=[0.002, wall_w / 2, CUP_DEPTH / 2],
-                      pos=[CUP_RADIUS * np.cos(a), CUP_RADIUS * np.sin(a), z0 + CUP_DEPTH / 2],
+        body.add_geom(type=mujoco.mjtGeom.mjGEOM_BOX, size=[CUP_WALL / 2, wall_w / 2, CUP_DEPTH / 2],
+                      pos=[r_wall * np.cos(a), r_wall * np.sin(a), z0 + CUP_DEPTH / 2],
                       quat=[np.cos(a / 2), 0, 0, np.sin(a / 2)], rgba=[*green[:3], 0.9],
-                      mass=0.01, **_NOCONTACT)
+                      mass=0.01, **_ARM_CONTACT, **_STIFF)
     body.add_site(name="cup_center", pos=[0, 0, z0 + CUP_DEPTH / 2])
 
 
@@ -57,18 +80,20 @@ def _add_room(spec: mujoco.MjSpec, room: Room):
         mujoco.mju_mat2Quat(quat, panel.rotation().flatten())
         spec.worldbody.add_geom(name=panel.name, type=mujoco.mjtGeom.mjGEOM_BOX,
                                 size=[*panel.half_extents, PANEL_THICKNESS / 2], pos=panel.center,
-                                quat=quat, rgba=panel.material.rgba, **_NOCONTACT)
+                                quat=quat, rgba=panel.material.rgba, **_ROOM_CONTACT)
 
 
 def build_model(room: Room | None = None) -> mujoco.MjModel:
-    """iiwa14 (torque-controlled, no actuators) + cup, optional room, and a mocap ball."""
+    """iiwa14 (torque-controlled, no actuators) + cup, optional room, and a free ball."""
     spec = mujoco.MjSpec.from_file(str(IIWA_XML))
     for a in list(spec.actuators):  # drop Menagerie's position servos; we apply torques directly
         spec.delete(a)
     for k in list(spec.keys):
         spec.delete(k)
     spec.option.timestep = 1e-3
-    spec.option.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT  # ball is kinematic; no arm contacts
+    for g in spec.geoms:  # Menagerie collision spheres: arm bits (visual meshes keep contype 0)
+        if g.contype or g.conaffinity:
+            g.contype, g.conaffinity = _ARM, 0
     spec.visual.global_.offwidth, spec.visual.global_.offheight = 960, 720
     _add_cup(spec.body("link7"))
     if room is not None:
@@ -79,10 +104,32 @@ def build_model(room: Room | None = None) -> mujoco.MjModel:
     spec.visual.headlight.diffuse = [0.5, 0.5, 0.5]
     spec.worldbody.add_light(pos=[1.5, 0, 6], dir=[-0.2, 0.1, -1], diffuse=[0.5, 0.5, 0.5],
                              type=mujoco.mjtLightType.mjLIGHT_DIRECTIONAL, castshadow=True)
-    ball = spec.worldbody.add_body(name="ball", mocap=True)
-    ball.add_geom(type=mujoco.mjtGeom.mjGEOM_SPHERE, size=[BALL_RADIUS, 0, 0],
-                  rgba=[1.0, 0.45, 0.0, 1.0], **_NOCONTACT)
+    ball = spec.worldbody.add_body(name="ball", pos=[0, 0, -5])
+    ball.add_freejoint(name="ball")
+    ball.add_geom(name="ball", type=mujoco.mjtGeom.mjGEOM_SPHERE, size=[BALL_RADIUS, 0, 0], mass=BALL_MASS,
+                  rgba=[1.0, 0.45, 0.0, 1.0], **_BALL_CONTACT, **_STIFF)
     return spec.compile()
+
+
+ARM_BODIES = [f"link{i}" for i in range(1, 8)]
+
+
+def set_ball(data: mujoco.MjData, pos: np.ndarray, vel: np.ndarray | None = None):
+    """Place the free ball (no rotation) and optionally set its linear velocity."""
+    data.qpos[N_ARM:N_ARM + 3] = pos
+    data.qpos[N_ARM + 3:N_ARM + 7] = [1, 0, 0, 0]
+    data.qvel[N_ARM:N_ARM + 6] = 0.0
+    if vel is not None:
+        data.qvel[N_ARM:N_ARM + 3] = vel
+
+
+def ball_in_cup(kin: "Kinematics", q: np.ndarray, p_ball: np.ndarray) -> bool:
+    """Whether the ball center lies inside the cup volume (rim included, up to half a ball above it)."""
+    center, axis, _ = kin(q)
+    d = p_ball - center
+    axial = d.dot(axis)
+    radial = np.linalg.norm(d - axial * axis)
+    return radial < CUP_RADIUS and -CUP_DEPTH / 2 < axial < CUP_DEPTH / 2 + BALL_RADIUS / 2
 
 
 class Kinematics:
@@ -91,18 +138,21 @@ class Kinematics:
     def __init__(self, model: mujoco.MjModel):
         self.model = model
         self.data = mujoco.MjData(model)
+        set_ball(self.data, np.array([0.0, 0.0, -5.0]))  # parked out of the way
         self.site = model.site("cup_center").id
         self.jacp = np.zeros((3, model.nv))
         self.jacr = np.zeros((3, model.nv))
+        self.lo, self.hi = model.jnt_range[:N_ARM].T  # arm joint limits
 
     def __call__(self, q: np.ndarray):
         """Returns cup center position, cup axis (opening direction), and the 6x7 Jacobian."""
-        self.data.qpos[:] = q
+        self.data.qpos[:N_ARM] = q
         mujoco.mj_kinematics(self.model, self.data)
         mujoco.mj_comPos(self.model, self.data)
         mujoco.mj_jacSite(self.model, self.data, self.jacp, self.jacr, self.site)
         R = self.data.site_xmat[self.site].reshape(3, 3)
-        return self.data.site_xpos[self.site].copy(), R[:, 2].copy(), np.vstack([self.jacp, self.jacr])
+        J = np.vstack([self.jacp[:, :N_ARM], self.jacr[:, :N_ARM]])
+        return self.data.site_xpos[self.site].copy(), R[:, 2].copy(), J
 
 
 def _cone_error(axis: np.ndarray, target_axis: np.ndarray, cone_rad: float):
@@ -126,7 +176,7 @@ def _task_step(J: np.ndarray, err: np.ndarray, axis: np.ndarray, q: np.ndarray, 
 
 
 def _solve_ik_from(kin: Kinematics, p_ball, target_axis, q_init, q_nominal, cone, iters, pos_tol):
-    lo, hi = kin.model.jnt_range.T
+    lo, hi = kin.lo, kin.hi
     q = q_init.copy()
     for _ in range(iters):
         x, axis, J = kin(q)
@@ -151,7 +201,7 @@ def solve_catch_ik(kin: Kinematics, p_ball: np.ndarray, v_ball: np.ndarray, q_gu
     q, ok = _solve_ik_from(kin, p_ball, target_axis, q_guess, q_guess, cone, iters, pos_tol)
     if ok or not restarts:
         return q, ok
-    lo, hi = kin.model.jnt_range.T
+    lo, hi = kin.lo, kin.hi
     rng = np.random.default_rng(0)
     best = None
     for _ in range(restarts):
@@ -195,7 +245,7 @@ class DiffIKReference:
                  gain: float = 20.0, max_speed: float = 3.0):
         self.kin, self.p, self.a, self.dt = kin, p_target, axis_target, dt
         self.gain, self.max_speed = gain, max_speed
-        self.lo, self.hi = kin.model.jnt_range.T
+        self.lo, self.hi = kin.lo, kin.hi
         self.q, self.v, self.t_next = Q_READY.copy(), np.zeros(len(Q_READY)), 0.0
 
     def __call__(self, t: float):
@@ -261,10 +311,13 @@ class CatchResult:
     p_cup_center: np.ndarray
     position_error: float
     axis_angle_deg: float  # angle between cup opening axis and -v_ball
-    success: bool
+    success: bool  # the ball is still inside the cup at the end of the run (simulated contact)
+    geometric_success: bool  # at t_catch the cup was within tolerance of the true ball (no contact)
     times: np.ndarray
     q: np.ndarray  # (T, 7) logged joint positions
-    ball: np.ndarray  # (T, 3) ball position at the logged times
+    ball: np.ndarray  # (T, 3) ball position at the logged times (replayed, then simulated)
+    t_release: float  # when the ball was handed to MuJoCo (inf if never)
+    arm_room_contact: bool  # the arm touched the room at some point
 
 
 def run_catch(throw: Throw, model: mujoco.MjModel | None = None, sim_time: float | None = None,
@@ -299,30 +352,52 @@ def run_catch(throw: Throw, model: mujoco.MjModel | None = None, sim_time: float
     sim_time = sim_time if sim_time is not None else min(t_c + 0.5, float(throw.times[-1]))
 
     data = mujoco.MjData(model)
-    data.qpos[:] = Q_READY
+    data.qpos[:N_ARM] = Q_READY
+    dt = model.opt.timestep
+    step_times = np.arange(0.0, sim_time + dt, dt)
+    replay_pos, replay_vel = throw.traj.sample(step_times)
+    set_ball(data, replay_pos[0], replay_vel[0])
     mujoco.mj_forward(model, data)
+    arm_ids = [model.body(name).id for name in ARM_BODIES]
+    arm_geoms = set(np.flatnonzero(np.isin(model.geom_bodyid, arm_ids)))
+    ball_geom = model.geom("ball").id
     kd = 2 * np.sqrt(kp)
     Mqdd = np.zeros(model.nv)
-    log_t, log_q = [], []
+    qdd = np.zeros(model.nv)
+    log_t, log_q, log_ball = [], [], []
+    t_release, arm_room_contact, i = np.inf, False, 0
     while data.time < sim_time:
+        released = np.isfinite(t_release)
+        if not released:  # replay the true flight until the ball comes near the arm
+            i = min(int(round(data.time / dt)), len(step_times) - 1)
+            set_ball(data, replay_pos[i], replay_vel[i])
+            if np.min(np.linalg.norm(data.xpos[arm_ids] - replay_pos[i], axis=1)) < RELEASE_DIST:
+                t_release = data.time
         if not log_t or data.time >= log_t[-1] + log_dt - 1e-9:
             log_t.append(data.time)
-            log_q.append(data.qpos.copy())
-        mujoco.mj_step1(model, data)  # computes M and bias forces at the current state
+            log_q.append(data.qpos[:N_ARM].copy())
+            log_ball.append(data.qpos[N_ARM:N_ARM + 3].copy())
+        mujoco.mj_step1(model, data)  # computes M, bias forces and contacts at the current state
+        for c in data.contact[:data.ncon]:
+            g = {int(c.geom1), int(c.geom2)}
+            if ball_geom not in g and len(g & arm_geoms) == 1:
+                arm_room_contact = True
         q_ref, v_ref, a_ref = reference(data.time)
-        qdd = a_ref + kp * (q_ref - data.qpos) + kd * (v_ref - data.qvel)
+        qdd[:N_ARM] = a_ref + kp * (q_ref - data.qpos[:N_ARM]) + kd * (v_ref - data.qvel[:N_ARM])
         mujoco.mj_mulM(model, data, Mqdd, qdd)
-        data.qfrc_applied[:] = np.clip(Mqdd + data.qfrc_bias, -TORQUE_LIMITS, TORQUE_LIMITS)
+        data.qfrc_applied[:N_ARM] = np.clip(Mqdd[:N_ARM] + data.qfrc_bias[:N_ARM], -TORQUE_LIMITS, TORQUE_LIMITS)
         mujoco.mj_step2(model, data)
-    times, q = np.array(log_t), np.array(log_q)
+    times, q, ball = np.array(log_t), np.array(log_q), np.array(log_ball)
 
-    # Score at t_c using the logged arm configuration closest in time.
+    # Geometric score at t_c, using the logged arm configuration closest in time.
     p_cup_center, cup_axis, _ = kin(q[np.argmin(abs(times - t_c))])
     err = float(np.linalg.norm(p_ball - p_cup_center))
     angle = float(np.degrees(np.arccos(np.clip(cup_axis.dot(-v_ball / np.linalg.norm(v_ball)), -1, 1))))
-    success = err < CUP_RADIUS - BALL_RADIUS / 2 and angle < cone_half_angle_deg
-    ball, _ = throw.traj.sample(times)
-    return CatchResult(t_c, p_ball, p_cup_center, err, angle, success, times, q, ball)
+    geometric = err < CUP_RADIUS - BALL_RADIUS / 2 and angle < cone_half_angle_deg
+    # Physical score: the ball is in the cup at the end.
+    caught = ball_in_cup(kin, data.qpos[:N_ARM].copy(), data.qpos[N_ARM:N_ARM + 3].copy())
+    return CatchResult(t_c, p_ball, p_cup_center, err, angle, bool(caught), bool(geometric), times, q, ball,
+                       float(t_release), arm_room_contact)
 
 
 def default_camera() -> mujoco.MjvCamera:
@@ -347,14 +422,14 @@ def add_path_to_scene(scene: mujoco.MjvScene, points: np.ndarray, rgba=(1.0, 0.4
 
 def render_frames(model: mujoco.MjModel, result: CatchResult, path_points: np.ndarray,
                   height: int = 480, width: int = 640) -> list[np.ndarray]:
-    """Offscreen-render the logged arm motion with the replayed ball."""
+    """Offscreen-render the logged arm motion and ball."""
     data = mujoco.MjData(model)
     cam = default_camera()
     frames = []
     with mujoco.Renderer(model, height, width) as renderer:
         for q, p in zip(result.q, result.ball):
-            data.qpos[:] = q
-            data.mocap_pos[0] = p
+            data.qpos[:N_ARM] = q
+            set_ball(data, p)
             mujoco.mj_forward(model, data)
             renderer.update_scene(data, camera=cam)
             add_path_to_scene(renderer.scene, path_points[::3])
