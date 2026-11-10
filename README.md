@@ -166,8 +166,9 @@ agrees (it picks the mean's pose in 82–92% of re-plans and almost never waits)
 could pay off where there is slack, e.g. with faster time-scaling of the moves (they are
 rest-to-rest cubics today).
 
-`docs/pillar_catch.html` (open it in a browser) shows a mean-only catch of a ball bouncing
-off the pillar, with these results.
+`docs/pillar_catch.html` (open it in a browser) shows four catches with these results: a bounce
+off the front pillar, reaching around the blocking pillar on the left and on the right, and a
+three-bounce throw.
 
 Catches are always scored against the true ball. `run_catch(planner=...)` takes any
 `(kin, throw, cone_deg) -> (catch index, joint reference)` callable.

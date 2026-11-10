@@ -29,6 +29,11 @@ p { margin: 0; max-width: 68ch; color: var(--muted); }
 figure { margin: 0; background: #000; border-radius: 8px; overflow: hidden; }
 figure img { display: block; width: 100%; height: auto; }
 figcaption { background: var(--surface); color: var(--muted); font-size: .85rem; padding: 10px 14px; border-top: 1px solid var(--line); }
+.clips { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); gap: 16px; }
+.clips figcaption { display: grid; gap: 2px; }
+.clips figcaption b { font-family: var(--display); font-weight: 500; color: var(--fg); font-size: .95rem; }
+.clips .meta { font-family: var(--mono); font-size: .72rem; letter-spacing: .04em; color: var(--accent); }
+main { max-width: 1100px; }
 .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .pair div { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; min-width: 0; }
 .pair b { font-family: var(--display); font-weight: 500; }
@@ -50,15 +55,30 @@ code { font-family: var(--mono); font-size: .85em; }
 <body>
 <main>
   <header>
-    <div class="eyebrow">Stage 2 + pillar · seed 11 · bounce off the pillar edge</div>
+    <div class="eyebrow">MuJoCo replays · about one third of real speed</div>
     <h1>Catching around a pillar</h1>
   </header>
-  <figure>
-    <img src="catch_pillar_seed11_replan.gif" alt="A KUKA arm catches a ball that has just bounced off the edge of a concrete pillar in front of it. The ball lands in the green cup.">
-    <figcaption>The ball clips the pillar at 0.75 s and is caught about 0.2 s later, 0.9 cm from the cup center, and stays in the cup. Played back at about one third of real speed; the orange line is the ball's true path.</figcaption>
-  </figure>
+  <section class="clips">
+    <figure>
+      <img src="catch_pillar_seed11_replan.gif" alt="A KUKA arm catches a ball that has just bounced off the edge of a concrete pillar in front of it." loading="lazy">
+      <figcaption><b>Bounce off a pillar</b><span class="meta">Mean-only · stage 2 + pillar · seed 11</span>The ball clips the pillar edge at 0.75 s and is caught about 0.2 s later, 0.9 cm from the cup center.</figcaption>
+    </figure>
+    <figure>
+      <img src="catch_blocking_left.gif" alt="Seen from the left, a KUKA arm reaches around the left side of a pillar directly in front of it and catches a high lob." loading="lazy">
+      <figcaption><b>Reaching around the left side</b><span class="meta">Uncertainty-aware · pillar blocking the arm · seed 5</span>The arm starts tucked behind a pillar inside its reach and commits to the left early; switching sides would take 3.9 s. Caught at 1.93 s, 0.9 cm off.</figcaption>
+    </figure>
+    <figure>
+      <img src="catch_blocking_right.gif" alt="Seen from the right, a KUKA arm reaches around the right side of a pillar directly in front of it and catches a high lob." loading="lazy">
+      <figcaption><b>Reaching around the right side</b><span class="meta">Uncertainty-aware · pillar blocking the arm · seed 18</span>The same layout with the lob passing on the right, filmed from the right. Caught at 2.05 s, 0.8 cm off.</figcaption>
+    </figure>
+    <figure>
+      <img src="catch_three_bounces.gif" alt="A ball bounces off a pillar, the wall behind the robot and the floor before the KUKA arm catches it." loading="lazy">
+      <figcaption><b>Three bounces</b><span class="meta">Uncertainty-aware · stage 3 + pillar + occlusion · seed 4</span>Off the pillar at 0.35 s, the back wall at 1.02 s and the floor at 1.16 s, then caught at 1.74 s, 1.2 cm off.</figcaption>
+    </figure>
+  </section>
+  <p>The orange line is the ball's true path. The ball is a simulated MuJoCo body near the arm, and a catch counts only if it stays in the cup.</p>
   <section class="pair">
-    <div><b>Mean-only planner</b><p>Every 50 ms the arm re-plans on the latest prediction of where the ball will be, starting each move from its current position and speed. Before the bounce the prediction is split between outcomes, so it plans on the most likely one and corrects as the prediction sharpens.</p></div>
+    <div><b>Two planners</b><p>Both re-plan every 50 ms on the latest prediction of where the ball will be, starting each move from the arm's current position and speed. Mean-only steers toward the most likely catch; uncertainty-aware weighs sampled scenarios first, as described below.</p></div>
     <div><b>What's simulated</b><p>The arm, its torque limits, and the ball near the arm are MuJoCo physics. The prediction can't sharpen while the pillar hides the ball from the camera.</p></div>
   </section>
   <section>
