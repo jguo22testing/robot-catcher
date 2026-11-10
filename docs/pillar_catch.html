@@ -61,7 +61,7 @@ code { font-family: var(--mono); font-size: .85em; }
   <section class="clips">
     <figure>
       <img src="catch_pillar_seed11_replan.gif" alt="A KUKA arm catches a ball that has just bounced off the edge of a concrete pillar in front of it." loading="lazy">
-      <figcaption><b>Bounce off a pillar</b><span class="meta">Mean-only · stage 2 + pillar · seed 11</span>The ball clips the pillar edge at 0.75 s and is caught about 0.2 s later, 0.9 cm from the cup center.</figcaption>
+      <figcaption><b>Bounce off a pillar</b><span class="meta">Mean-only · stage 2 + pillar + occlusion · seed 11</span>The ball clips the pillar edge at 0.75 s and is caught about 0.2 s later, 0.9 cm from the cup center.</figcaption>
     </figure>
     <figure>
       <img src="catch_blocking_left.gif" alt="Seen from the left, a KUKA arm reaches around the left side of a pillar directly in front of it and catches a high lob." loading="lazy">
@@ -79,22 +79,24 @@ code { font-family: var(--mono); font-size: .85em; }
   <p>The orange line is the ball's true path. The ball is a simulated MuJoCo body near the arm, and a catch counts only if it stays in the cup.</p>
   <section class="pair">
     <div><b>Two planners</b><p>Both re-plan every 50 ms on the latest prediction of where the ball will be, starting each move from the arm's current position and speed. Mean-only steers toward the most likely catch; uncertainty-aware weighs sampled scenarios first, as described below.</p></div>
-    <div><b>What's simulated</b><p>The arm, its torque limits, and the ball near the arm are MuJoCo physics. The prediction can't sharpen while the pillar hides the ball from the camera.</p></div>
+    <div><b>What's simulated</b><p>The arm, its torque limits, and the ball near the arm are MuJoCo physics. With occlusion on, the prediction can't sharpen while the pillar hides the ball from the camera.</p></div>
   </section>
   <section>
     <h2>Catch rates</h2>
     <div class="tbl"><table>
-      <thead><tr><th>Setup</th><th>Oracle</th><th>Mean-only</th><th>Uncertainty-aware</th></tr></thead>
+      <thead><tr><th>Setup</th><th>Prediction</th><th>Oracle</th><th>Mean-only</th><th>Uncertainty-aware</th></tr></thead>
       <tbody>
-        <tr><td>Stage 2 + pillar (60 throws)</td><td>49</td><td>40</td><td>40</td></tr>
-        <tr><td>Stage 2 + pillar + occlusion (60)</td><td>49</td><td>40</td><td>40</td></tr>
-        <tr><td>Stage 3 + pillar + occlusion (60)</td><td>40</td><td>33</td><td>32</td></tr>
-        <tr><td>Pillar blocking the arm, velocity error 0.06 m/s (40)</td><td>37</td><td>26</td><td>26</td></tr>
-        <tr><td>Pillar blocking the arm, 0.15 m/s (40)</td><td>37</td><td>23</td><td>20</td></tr>
-        <tr><td>Pillar blocking the arm, 0.3 m/s (40)</td><td>37</td><td>9</td><td>9</td></tr>
+        <tr><td>Stage 2, no pillar (60 throws)</td><td>Gaussian</td><td>44</td><td>28</td><td>29</td></tr>
+        <tr><td>Stage 2 + pillar (60)</td><td>Gaussian</td><td>49</td><td>31</td><td>34</td></tr>
+        <tr><td>Stage 2 + pillar (60)</td><td>Particle</td><td>49</td><td>40</td><td>40</td></tr>
+        <tr><td>Stage 2 + pillar + occlusion (60)</td><td>Particle</td><td>49</td><td>40</td><td>40</td></tr>
+        <tr><td>Stage 3 + pillar + occlusion (60)</td><td>Particle</td><td>40</td><td>33</td><td>32</td></tr>
+        <tr><td>Pillar blocking the arm (40)</td><td>Particle, velocity error 0.06 m/s</td><td>37</td><td>26</td><td>26</td></tr>
+        <tr><td>Pillar blocking the arm (40)</td><td>Particle, 0.15 m/s</td><td>37</td><td>23</td><td>20</td></tr>
+        <tr><td>Pillar blocking the arm (40)</td><td>Particle, 0.3 m/s</td><td>37</td><td>9</td><td>9</td></tr>
       </tbody>
     </table></div>
-    <p style="margin-top:10px">A catch means the ball stays in the cup. The oracle plans on the true ball path and marks the ceiling for this arm. In the blocking rows the pillar stands straight ahead inside the arm's reach: reaching around it to either side takes about 2 s and switching sides about 3.9 s, so the arm has to commit to a side early.</p>
+    <p style="margin-top:10px">A catch means the ball stays in the cup. The oracle plans on the true ball path and marks the ceiling for this arm. The Gaussian prediction is one bell curve that widens with time and bounces; the particle prediction simulates 96 possible balls and can split into several outcomes. They aren't comparable with each other: the particle one knows the room exactly. In the blocking rows the pillar stands straight ahead inside the arm's reach: reaching around it to either side takes about 2 s and switching sides about 3.9 s, so the arm has to commit to a side early.</p>
   </section>
   <section class="explain">
     <h2>What the uncertainty-aware planner does</h2>
